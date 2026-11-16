@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Derived from a "LJ9 Chassis" board found in an LG OLED55B9PLA TV, booted via lxboot
+ */
+
+/dts-v1/;
+
+/memreserve/ 0x0000000000000000 0x0000000000001000;
+
+#include "lg1314.dtsi"
+
+/ {
+	model = "LG Electronics, DTV SoC LG1314 (AArch64)";
+	compatible = "lge,lg1314", "lge,lg1k";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x3e400000>,
+		      <0x4f400000 0x30c00000>,
+		      <0xaf000000 0x11000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		kdrv_buffer1@4f400000 {
+			no-map;
+			reg = <0x4f400000 0x30c00000>;
+		};
+
+		kdrv_buffer2@af000000 {
+			no-map;
+			reg = <0xaf000000 0x11000000>;
+		};
+	};
+};
