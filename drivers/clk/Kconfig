@@ -50,6 +50,15 @@ config CLK_HSDK
 	  This driver supports the HSDK core, system, ddr, tunnel and hdmi PLLs
 	  control.
 
+config CLK_LG1K
+	bool "Clock controller for LG LG1314 (lg1k) SoCs"
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on HAS_IOMEM
+	default ARCH_LG1K
+	help
+	  Support for the CPU clock domain (CPU PLL + CPU divider) on LG
+	  LG1314-class SoCs. Required for cpufreq.
+
 config LMK04832
 	tristate "Ti LMK04832 JESD204B Compliant Clock Jitter Cleaner"
 	depends on SPI

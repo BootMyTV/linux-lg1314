@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <dt-bindings/clock/lge,lg1314-clk.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 
 / {
@@ -16,7 +17,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a53";
 			reg = <0x0>;
-			clocks = <&cpuclk>;
+			clocks = <&clkc LG1314_CLK_CPU>;
 			clock-names = "cpuclk";
 			cpu0-supply = <&reg_cpu0>;
 			operating-points-v2 = <&cpu_opp_table>;
@@ -91,24 +92,15 @@
 			clock-output-names = "xtal";
 		};
 
-		cpupll: clock@c9c60634 {
+		clkc: clock-controller@c9c60634 {
 			compatible = "lge,lg1314-clk";
-			reg = <0xc9c60634 0x0c>, <0xc9230004 0x04>;
+			/* CPU PLL ctrl, CPU PLL switch, GPU PLL ctrl (CTOP_DPE) */
+			reg = <0xc9c60634 0x0c>, <0xc9230004 0x04>,
+			      <0xc930a0d8 0x08>;
 			clocks = <&xtal>;
 			clock-names = "xtal";
-			clock-output-names = "cpupll";
 			fix = <0x10000000 0x00 0x400000>;
-			#clock-cells = <0>;
-		};
-
-		cpuclk: cpuclk {
-			compatible = "fixed-factor-clock";
-			#clock-cells = <0>;
-			clocks = <&cpupll>;
-			clock-names = "cpupll";
-			clock-mult = <1>;
-			clock-div = <2>;
-			clock-output-names = "cpuclk";
+			#clock-cells = <1>;
 		};
 
 		busclk: busclk {
@@ -120,19 +112,6 @@
 			clock-output-names = "busclk";
 		};
 
-		/*
-		 * GPU clock. The boot firmware configures and enables the GPU
-		 * clock before Linux; nothing in-kernel gates it. Modelled as a
-		 * fixed-clock so the GPU driver has a handle to enable (a no-op).
-		 * The frequency is nominal and used only for reporting until a
-		 * real GPU PLL/devfreq driver is wired.
-		 */
-		gpuclk: gpuclk {
-			compatible = "fixed-clock";
-			#clock-cells = <0>;
-			clock-frequency = <600000000>;
-			clock-output-names = "gpuclk";
-		};
 	};
 
 	reg_cpu0: regulator {
@@ -397,7 +376,7 @@
 				     <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "job", "mmu", "gpu";
-			clocks = <&gpuclk>;
+			clocks = <&clkc LG1314_CLK_GPU>;
 			clock-names = "core";
 		};
 	};
