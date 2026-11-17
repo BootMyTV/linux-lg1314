@@ -44,3 +44,30 @@
 		};
 	};
 };
+
+/* External-port USB VBUS enables (the PHY ctrl-gpios; no PHY driver, so hog
+ * them on). VBUS-on = line high per the vendor phy-lg1k-usb driver. */
+&gpio11 {
+	usb0-vbus-hog {
+		gpio-hog;
+		gpios = <2 0>;
+		output-high;
+		line-name = "usb0-vbus";
+	};
+
+	usb1-vbus-hog {
+		gpio-hog;
+		gpios = <7 0>;
+		output-high;
+		line-name = "usb1-vbus";
+	};
+};
+
+&gpio1 {
+	usb2-vbus-hog {
+		gpio-hog;
+		gpios = <6 0>;
+		output-high;
+		line-name = "usb2-vbus";
+	};
+};
