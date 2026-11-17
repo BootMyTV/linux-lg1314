@@ -192,17 +192,23 @@ static const struct clk_ops lg1k_pll_ops = {
 };
 
 /*
- * GPU PLL + gate. The PLL control words sit in an unscrambled window (no 'fix'
- * mask) and use the same field layout as the CPU PLL, except the feedback
- * pre-divider divides by M directly (not M+1). The firmware sets the rate; this
- * clock only reports it and drives the gate, so there is no set_rate/round_rate.
+ * GPU PLL (CTOP_DPE gpupll). Unscrambled window (no 'fix' mask); same field
+ * layout as the CPU PLL but the feedback divider divides by M directly (not
+ * M+1). The boot firmware leaves it at ~660 MHz. set_rate reconfigures it with
+ * the vendor cold-boot relock seen in the secureboot SHB 'top' record (write
+ * ctrl with spread-spectrum held off via the 'dss' bit, settle, release),
+ * bracketed by a park on the gpu_clk_sel mux so the live GPU does not glitch
+ * while the PLL relocks (mirrors the CPU PLL's switch-bit park).
  */
 #define GPU_PLL_CTRL0		0x00	/* CTOP_DPE gpupll word 0 (0xc930a0d8) */
 #define GPU_PLL_CTRL1		0x04	/* CTOP_DPE gpupll word 1 (0xc930a0dc) */
+#define GPU_PLL_DSS		BIT(2)	/* ctrl0: spread spectrum, held off on relock */
+#define GPU_SEL			BIT(28)	/* gpu_clk_sel: park GPU off gpupll (0xc9c10464) */
 
 struct lg1k_gpu {
 	struct clk_hw		hw;
 	void __iomem		*ctrl;	/* gpupll control words	*/
+	void __iomem		*sel;	/* gpu_clk_sel mux	*/
 };
 
 #define to_lg1k_gpu(_hw)	container_of(_hw, struct lg1k_gpu, hw)
@@ -228,8 +234,45 @@ static unsigned long lg1k_gpu_recalc_rate(struct clk_hw *hw,
 	return ((((npc << 2) + nsc) * in_mhz / m) >> od) * 1000000;
 }
 
+static int lg1k_gpu_set_rate(struct clk_hw *hw, unsigned long rate,
+			     unsigned long parent_rate)
+{
+	struct lg1k_gpu *gpu = to_lg1k_gpu(hw);
+	u32 r[3], sel;
+	int ret;
+
+	r[0] = readl_relaxed(gpu->ctrl + GPU_PLL_CTRL0);
+	r[1] = readl_relaxed(gpu->ctrl + GPU_PLL_CTRL1);
+	r[2] = 0;
+
+	ret = lg1k_pll_find_ctrl(r, rate, parent_rate);
+	if (ret)
+		return ret;
+
+	/* recalc floors M to 1 and find_ctrl solves for /1; pin M to match. */
+	r[0] &= ~PLL_M;
+
+	/* Park the GPU on the alternate source while the PLL relocks. */
+	sel = readl_relaxed(gpu->sel);
+	writel_relaxed(sel | GPU_SEL, gpu->sel);
+
+	/* Reconfigure with spread spectrum held off (dss=1), then release. */
+	writel_relaxed(r[0] | GPU_PLL_DSS, gpu->ctrl + GPU_PLL_CTRL0);
+	writel_relaxed(r[1], gpu->ctrl + GPU_PLL_CTRL1);
+	udelay(50);				/* PLL relock */
+	writel_relaxed(r[0] & ~GPU_PLL_DSS, gpu->ctrl + GPU_PLL_CTRL0);
+	udelay(10);
+
+	/* Unpark. */
+	writel_relaxed(sel & ~GPU_SEL, gpu->sel);
+
+	return 0;
+}
+
 static const struct clk_ops lg1k_gpu_ops = {
 	.recalc_rate	= lg1k_gpu_recalc_rate,
+	.round_rate	= lg1k_pll_round_rate,
+	.set_rate	= lg1k_gpu_set_rate,
 };
 
 static struct clk_hw *lg1k_gpu_register(struct device_node *np,
@@ -250,7 +293,8 @@ static struct clk_hw *lg1k_gpu_register(struct device_node *np,
 		return ERR_PTR(-ENOMEM);
 
 	gpu->ctrl = of_iomap(np, 2);
-	if (!gpu->ctrl) {
+	gpu->sel = of_iomap(np, 3);
+	if (!gpu->ctrl || !gpu->sel) {
 		ret = -ENOMEM;
 		goto err;
 	}
@@ -265,6 +309,8 @@ static struct clk_hw *lg1k_gpu_register(struct device_node *np,
 err:
 	if (gpu->ctrl)
 		iounmap(gpu->ctrl);
+	if (gpu->sel)
+		iounmap(gpu->sel);
 	kfree(gpu);
 	return ERR_PTR(ret);
 }

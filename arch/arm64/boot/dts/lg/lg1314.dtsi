@@ -94,9 +94,10 @@
 
 		clkc: clock-controller@c9c60634 {
 			compatible = "lge,lg1314-clk";
-			/* CPU PLL ctrl, CPU PLL switch, GPU PLL ctrl (CTOP_DPE) */
+			/* CPU PLL ctrl, CPU PLL switch, GPU PLL ctrl (CTOP_DPE),
+			 * GPU clk-sel mux */
 			reg = <0xc9c60634 0x0c>, <0xc9230004 0x04>,
-			      <0xc930a0d8 0x08>;
+			      <0xc930a0d8 0x0c>, <0xc9c10464 0x04>;
 			clocks = <&xtal>;
 			clock-names = "xtal";
 			fix = <0x10000000 0x00 0x400000>;
@@ -378,6 +379,20 @@
 			interrupt-names = "job", "mmu", "gpu";
 			clocks = <&clkc LG1314_CLK_GPU>;
 			clock-names = "core";
+			operating-points-v2 = <&gpu_opp_table>;
+
+			/*
+			 * Freq-only OPPs (no opp-microvolt -> no regulator): lets
+			 * Panfrost devfreq drive gpupll via clk-lg1k set_rate.
+			 * 660 = firmware/reset rate; 528 = m-pll/2 (the park src);
+			 * 396 = a low point. All exact per lg1k_pll_round_rate.
+			 */
+			gpu_opp_table: opp-table {
+				compatible = "operating-points-v2";
+				opp-396000000 { opp-hz = /bits/ 64 <396000000>; };
+				opp-528000000 { opp-hz = /bits/ 64 <528000000>; };
+				opp-660000000 { opp-hz = /bits/ 64 <660000000>; };
+			};
 		};
 	};
 
