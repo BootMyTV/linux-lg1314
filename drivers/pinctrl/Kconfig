@@ -331,6 +331,16 @@ config PINCTRL_LANTIQ
 	select PINMUX
 	select PINCONF
 
+config PINCTRL_LG1314
+	bool "LG LG1314 (M19A1) pin controller"
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on OF
+	select PINMUX
+	help
+	  Pin multiplexing controller for the LG1314 DTV SoC. Required for the
+	  on-chip GPIO banks (PL061) to probe, since their gpio-ranges reference
+	  this pin controller.
+
 config PINCTRL_FALCON
 	bool
 	depends on SOC_FALCON

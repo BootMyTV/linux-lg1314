@@ -212,7 +212,7 @@
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3000000 0x1000>;
 			interrupts = <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -227,7 +227,7 @@
 				gpio-pinmux = <0x60000000 0x60000000>;
 				ctrl-gpios = <&gpio11 2 1>;
 				ocd-gpios = <&gpio11 3 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -235,7 +235,7 @@
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3100000 0x1000>;
 			interrupts = <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -248,7 +248,7 @@
 				phy-rst-msk = <0x02 0x02>;
 				ctrl-gpios = <&gpio11 7 1>;
 				ocd-gpios = <&gpio11 6 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -256,7 +256,7 @@
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3200000 0x1000>;
 			interrupts = <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -269,7 +269,7 @@
 				phy-rst-msk = <0x04 0x04>;
 				ctrl-gpios = <&gpio1 6 1>;
 				ocd-gpios = <&gpio1 2 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -277,7 +277,7 @@
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3300000 0x1000>;
 			interrupts = <GIC_SPI 70 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -288,7 +288,7 @@
 				      <0xc930e41c 0x10>, <0xc930e424 0x04>;
 				reg-names = "base", "host", "phy", "phyrst";
 				phy-rst-msk = <0x01 0x01>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -296,7 +296,7 @@
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3004000 0x1000>;
 			interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -311,7 +311,7 @@
 				gpio-pinmux = <0x60000000 0x60000000>;
 				ctrl-gpios = <&gpio11 2 1>;
 				ocd-gpios = <&gpio11 3 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -319,7 +319,7 @@
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3104000 0x1000>;
 			interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -332,7 +332,7 @@
 				phy-rst-msk = <0x02 0x02>;
 				ctrl-gpios = <&gpio11 7 1>;
 				ocd-gpios = <&gpio11 6 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -340,7 +340,7 @@
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3204000 0x1000>;
 			interrupts = <GIC_SPI 103 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -353,7 +353,7 @@
 				phy-rst-msk = <0x04 0x04>;
 				ctrl-gpios = <&gpio1 6 1>;
 				ocd-gpios = <&gpio1 2 1>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
@@ -361,7 +361,7 @@
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3304000 0x1000>;
 			interrupts = <GIC_SPI 71 IRQ_TYPE_LEVEL_HIGH>;
-			status = "disabled";
+			status = "okay";
 			#address-cells = <1>;
 			#size-cells = <1>;
 			ranges;
@@ -372,7 +372,7 @@
 				      <0xc930e41c 0x10>, <0xc930e424 0x04>;
 				reg-names = "base", "host", "phy", "phyrst";
 				phy-rst-msk = <0x01 0x01>;
-				status = "disabled";
+				status = "okay";
 			};
 		};
 
