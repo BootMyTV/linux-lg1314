@@ -113,9 +113,13 @@ struct lg1314_mmio {
 #define LG1314_PANEL_W			3840
 #define LG1314_PANEL_H			2160
 
-/* Graphics plane (framebuffer) — 1920x1080, SR-scaled 2x to the panel. */
+/* Graphics plane (framebuffer) — SR-scaled to the 3840x2160 panel. Exposed
+ * input sizes range from 1280x720 to 1920x1080.
+ */
 #define LG1314_FB_W			1920
 #define LG1314_FB_H			1080
+#define LG1314_FB_MIN_W			1280
+#define LG1314_FB_MIN_H			720
 
 struct lg1314_drm {
 	struct drm_device		drm;

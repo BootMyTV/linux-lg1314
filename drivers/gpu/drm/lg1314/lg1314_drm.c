@@ -152,26 +152,36 @@ static const struct drm_simple_display_pipe_funcs lg1314_pipe_funcs = {
 /* --------------------------------------------------------------- connector -- */
 
 /*
- * Userspace sees 1920x1080 — the OSD graphics plane size. The driver scales it
- * 2x to the 3840x2160 panel via the OSD SR block. Timings are nominal 1080p60;
- * the real panel timing is fixed by the OVI VX1 table.
+ * The OSD graphics plane is SR-scaled to the 3840x2160 panel. The OSD header
+ * input size is set from the framebuffer per flip; the SR output is fixed to
+ * the panel. Timings are nominal; the real panel timing is fixed by the OVI
+ * VX1 table.
  */
-static const struct drm_display_mode lg1314_mode = {
-	DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
+static const struct drm_display_mode lg1314_modes[] = {
+	{ DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 		 148500, 1920, 2008, 2052, 2200, 0,
 		 1080, 1084, 1089, 1125, 0,
-		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
+	{ DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER,
+		 74250, 1280, 1390, 1430, 1650, 0,
+		 720, 725, 730, 750, 0,
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
 };
 
 static int lg1314_conn_get_modes(struct drm_connector *connector)
 {
-	struct drm_display_mode *mode;
+	int i, count = 0;
 
-	mode = drm_mode_duplicate(connector->dev, &lg1314_mode);
-	if (!mode)
-		return 0;
-	drm_mode_probed_add(connector, mode);
-	return 1;
+	for (i = 0; i < ARRAY_SIZE(lg1314_modes); i++) {
+		struct drm_display_mode *mode;
+
+		mode = drm_mode_duplicate(connector->dev, &lg1314_modes[i]);
+		if (!mode)
+			continue;
+		drm_mode_probed_add(connector, mode);
+		count++;
+	}
+	return count;
 }
 
 static const struct drm_connector_helper_funcs lg1314_conn_helper_funcs = {
@@ -216,9 +226,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 	if (ret)
 		return ret;
 
-	drm->mode_config.min_width = LG1314_FB_W;
+	drm->mode_config.min_width = LG1314_FB_MIN_W;
 	drm->mode_config.max_width = LG1314_FB_W;
-	drm->mode_config.min_height = LG1314_FB_H;
+	drm->mode_config.min_height = LG1314_FB_MIN_H;
 	drm->mode_config.max_height = LG1314_FB_H;
 	drm->mode_config.funcs = &lg1314_mode_config_funcs;
 
