@@ -212,65 +212,27 @@
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3000000 0x1000>;
 			interrupts = <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb0_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3000000 {
-				compatible = "lge,lg1k-usb2phy";
-				reg = <0xc3000000 0x20>, <0xc3400000 0x20>,
-				      <0xc9303c04 0x10>, <0xc9303c00 0x04>,
-				      <0xc9308830 0x04>;
-				reg-names = "base", "host", "phy", "phyrst", "pinmux";
-				phy-rst-msk = <0x01 0x01>;
-				gpio-pinmux = <0x60000000 0x60000000>;
-				ctrl-gpios = <&gpio11 2 1>;
-				ocd-gpios = <&gpio11 3 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3100000 {
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3100000 0x1000>;
 			interrupts = <GIC_SPI 100 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb1_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3100000 {
-				compatible = "lge,lg1k-usb2phy";
-				reg = <0xc3100000 0x20>, <0xc3410000 0x20>,
-				      <0xc9303c0c 0x10>, <0xc9303c00 0x04>;
-				reg-names = "base", "host", "phy", "phyrst";
-				phy-rst-msk = <0x02 0x02>;
-				ctrl-gpios = <&gpio11 7 1>;
-				ocd-gpios = <&gpio11 6 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3200000 {
 			compatible = "lge,lg115x-ehci", "generic-ehci";
 			reg = <0xc3200000 0x1000>;
 			interrupts = <GIC_SPI 102 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3200000 {
-				compatible = "lge,lg1k-usb2phy";
-				reg = <0xc3200000 0x20>, <0xc3420000 0x20>,
-				      <0xc9303c14 0x10>, <0xc9303c00 0x04>;
-				reg-names = "base", "host", "phy", "phyrst";
-				phy-rst-msk = <0x04 0x04>;
-				ctrl-gpios = <&gpio1 6 1>;
-				ocd-gpios = <&gpio1 2 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3300000 {
@@ -296,65 +258,27 @@
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3004000 0x1000>;
 			interrupts = <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb0_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3004000 {
-				compatible = "lge,lg1k-usb1phy";
-				reg = <0xc3004000 0x20>, <0xc3400000 0x20>,
-				      <0xc9303c04 0x10>, <0xc9303c00 0x04>,
-				      <0xc9308830 0x04>;
-				reg-names = "base", "host", "phy", "phyrst", "pinmux";
-				phy-rst-msk = <0x01 0x01>;
-				gpio-pinmux = <0x60000000 0x60000000>;
-				ctrl-gpios = <&gpio11 2 1>;
-				ocd-gpios = <&gpio11 3 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3104000 {
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3104000 0x1000>;
 			interrupts = <GIC_SPI 101 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb1_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3104000 {
-				compatible = "lge,lg1k-usb1phy";
-				reg = <0xc3104000 0x20>, <0xc3410000 0x20>,
-				      <0xc9303c0c 0x10>, <0xc9303c00 0x04>;
-				reg-names = "base", "host", "phy", "phyrst";
-				phy-rst-msk = <0x02 0x02>;
-				ctrl-gpios = <&gpio11 7 1>;
-				ocd-gpios = <&gpio11 6 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3204000 {
 			compatible = "lge,lg115x-ohci", "generic-ohci";
 			reg = <0xc3204000 0x1000>;
 			interrupts = <GIC_SPI 103 IRQ_TYPE_LEVEL_HIGH>;
+			phys = <&usb2_phy>;
+			phy-names = "usb";
 			status = "okay";
-			#address-cells = <1>;
-			#size-cells = <1>;
-			ranges;
-
-			phy@c3204000 {
-				compatible = "lge,lg1k-usb1phy";
-				reg = <0xc3204000 0x20>, <0xc3420000 0x20>,
-				      <0xc9303c14 0x10>, <0xc9303c00 0x04>;
-				reg-names = "base", "host", "phy", "phyrst";
-				phy-rst-msk = <0x04 0x04>;
-				ctrl-gpios = <&gpio1 6 1>;
-				ocd-gpios = <&gpio1 2 1>;
-				status = "okay";
-			};
 		};
 
 		usb@c3304000 {
@@ -374,6 +298,47 @@
 				phy-rst-msk = <0x01 0x01>;
 				status = "okay";
 			};
+		};
+
+		/*
+		 * External host-port PHYs. Shared by each port's EHCI+OHCI pair;
+		 * they manage VBUS (ctrl-gpios, active high), PHY reset (phyrst)
+		 * and, on port 0, the GPIO pinmux. The internal port (c3300000)
+		 * has no VBUS gpio and is left to the boot firmware.
+		 */
+		usb0_phy: usb-phy@c9303c04 {
+			compatible = "lge,lg1k-usb2phy";
+			reg = <0xc9303c04 0x10>, <0xc3000000 0x20>,
+			      <0xc3400000 0x20>, <0xc9303c00 0x04>,
+			      <0xc9308830 0x04>;
+			reg-names = "phy", "base", "host", "phyrst", "pinmux";
+			phy-rst-msk = <0x01 0x01>;
+			gpio-pinmux = <0x60000000 0x60000000>;
+			ctrl-gpios = <&gpio11 2 0>;
+			ocd-gpios = <&gpio11 3 0>;
+			#phy-cells = <0>;
+		};
+
+		usb1_phy: usb-phy@c9303c0c {
+			compatible = "lge,lg1k-usb2phy";
+			reg = <0xc9303c0c 0x10>, <0xc3100000 0x20>,
+			      <0xc3410000 0x20>, <0xc9303c00 0x04>;
+			reg-names = "phy", "base", "host", "phyrst";
+			phy-rst-msk = <0x02 0x02>;
+			ctrl-gpios = <&gpio11 7 0>;
+			ocd-gpios = <&gpio11 6 0>;
+			#phy-cells = <0>;
+		};
+
+		usb2_phy: usb-phy@c9303c14 {
+			compatible = "lge,lg1k-usb2phy";
+			reg = <0xc9303c14 0x10>, <0xc3200000 0x20>,
+			      <0xc3420000 0x20>, <0xc9303c00 0x04>;
+			reg-names = "phy", "base", "host", "phyrst";
+			phy-rst-msk = <0x04 0x04>;
+			ctrl-gpios = <&gpio1 6 0>;
+			ocd-gpios = <&gpio1 2 0>;
+			#phy-cells = <0>;
 		};
 
 		eth0: ethernet@c3700000 {

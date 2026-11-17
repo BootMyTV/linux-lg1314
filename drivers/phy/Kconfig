@@ -36,6 +36,15 @@ config PHY_LPC18XX_USB_OTG
 	  This driver is need for USB0 support on LPC18xx/43xx and takes
 	  care of enabling and clock setup.
 
+config PHY_LG1314_USB
+	tristate "LG LG1314 USB host PHY driver"
+	depends on OF && (ARCH_LG1K || COMPILE_TEST)
+	select GENERIC_PHY
+	help
+	  Enable this to support the USB 2.0 host PHYs on the LG LG1314 (M19A1)
+	  DTV SoC: per-port VBUS, PHY reset and pinmux for the on-SoC EHCI/OHCI
+	  host ports.
+
 config PHY_PISTACHIO_USB
 	tristate "IMG Pistachio USB2.0 PHY driver"
 	depends on MIPS || COMPILE_TEST
