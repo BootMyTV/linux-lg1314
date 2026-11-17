@@ -33,14 +33,45 @@
 		#size-cells = <1>;
 		ranges;
 
-		kdrv_buffer1@4f400000 {
+		/*
+		 * The DE firmware embeds absolute DDR pointers; its image and
+		 * working buffers must sit at their expected base (0x50000000,
+		 * spanning to ~0x554b0568). Reserve it fixed and keep scanout out.
+		 */
+		de_fw: de-fw@50000000 {
+			reg = <0x50000000 0x06000000>;
 			no-map;
-			reg = <0x4f400000 0x30c00000>;
+		};
+
+		/* Scanout DMA pool, clear of the DE firmware region. */
+		display_pool: display-pool@56000000 {
+			compatible = "shared-dma-pool";
+			reg = <0x56000000 0x08000000>;
+			no-map;
+		};
+
+		kdrv_buffer1@5e000000 {
+			no-map;
+			reg = <0x5e000000 0x22000000>;
 		};
 
 		kdrv_buffer2@af000000 {
 			no-map;
 			reg = <0xaf000000 0x11000000>;
 		};
+	};
+
+	display: display-subsystem {
+		compatible = "lge,lg1314-drm";
+		memory-region = <&display_pool>, <&de_fw>;
+		memory-region-names = "scanout", "de-fw";
+		lge,micom = <&micom>;
+	};
+};
+
+&micom_i2c {
+	micom: micom@29 {
+		compatible = "lge,lg1314-micom";
+		reg = <0x29>;
 	};
 };

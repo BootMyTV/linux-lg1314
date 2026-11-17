@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0
+config DRM_LG1314
+	tristate "DRM support for LG1314 OLED display"
+	depends on DRM && OF
+	depends on ARCH_LG1K || COMPILE_TEST
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  DRM/KMS driver for the LG1314 (M19) display pipeline
+	  (OSD -> DE -> OVI -> VX1 -> WRGB OLED) used in 2019 LG B9
+	  OLED TVs such as the OLED55B9PLA.
+
+	  If M here, the module is called lg1314-drm.

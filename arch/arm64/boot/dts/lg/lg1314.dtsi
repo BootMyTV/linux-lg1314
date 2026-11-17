@@ -725,7 +725,7 @@
 			#size-cells = <0>;
 		};
 
-		i2c@fe400000 {
+		micom_i2c: i2c@fe400000 {
 			compatible = "lge,lg1k-i2c";
 			reg = <0xfe400000 0x1000>;
 			interrupts = <GIC_SPI 27 IRQ_TYPE_LEVEL_HIGH>;
