@@ -517,4 +517,14 @@ config LOONGSON2_THERMAL
 	  is higher than the high temperature threshold or lower than the low
 	  temperature threshold, the interrupt will occur.
 
+config LG1314_THERMAL
+	tristate "LG1314 (lg1k / M19) SoC temperature sensor"
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on OF
+	help
+	  Support for the on-die TSADC temperature sensor on LGE lg1k-family
+	  SoCs (e.g. LG1314 / M19). Exposes a thermal zone so cpufreq/devfreq
+	  cooling can throttle the SoC. Say Y if you are building for an LG TV
+	  based on this SoC.
+
 endif

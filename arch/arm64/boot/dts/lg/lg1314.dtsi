@@ -2,6 +2,7 @@
 
 #include <dt-bindings/clock/lge,lg1314-clk.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "lge,lg1314", "lge,lg1k";
@@ -21,6 +22,7 @@
 			clock-names = "cpuclk";
 			cpu0-supply = <&reg_cpu0>;
 			operating-points-v2 = <&cpu_opp_table>;
+			#cooling-cells = <2>;
 		};
 		cpu1: cpu@1 {
 			device_type = "cpu";
@@ -42,6 +44,35 @@
 			reg = <0x3>;
 			enable-method = "psci";
 			operating-points-v2 = <&cpu_opp_table>;
+		};
+	};
+
+	thermal-zones {
+		cpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&tsensor>;
+
+			trips {
+				cpu_alert: cpu-alert {
+					temperature = <85000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu_crit: cpu-crit {
+					temperature = <105000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_alert>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 	};
 
@@ -177,6 +208,12 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges;
+
+		tsensor: temperature-sensor@c9a04000 {
+			compatible = "lge,lg1314-tsensor";
+			reg = <0xc9a04000 0x18>;
+			#thermal-sensor-cells = <0>;
+		};
 
 		mmc@c3600000 {
 			compatible = "lge,lg1k-sdhci-5.0-v3";
