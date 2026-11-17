@@ -119,6 +119,20 @@
 			clock-div = <4>;
 			clock-output-names = "busclk";
 		};
+
+		/*
+		 * GPU clock. The boot firmware configures and enables the GPU
+		 * clock before Linux; nothing in-kernel gates it. Modelled as a
+		 * fixed-clock so the GPU driver has a handle to enable (a no-op).
+		 * The frequency is nominal and used only for reporting until a
+		 * real GPU PLL/devfreq driver is wired.
+		 */
+		gpuclk: gpuclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <600000000>;
+			clock-output-names = "gpuclk";
+		};
 	};
 
 	reg_cpu0: regulator {
@@ -369,6 +383,22 @@
 			compatible = "lge,lg1k-zacc-dec";
 			reg = <0xe0001000 0x1000>;
 			interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/*
+		 * Mali-T820 (Midgard) 3D GPU, driven by Panfrost. reg window and
+		 * interrupt numbers taken from the stock mali_kbase io_resources
+		 * table; the three interrupts are job/mmu/gpu (SPI 94/95/93).
+		 */
+		gpu: gpu@c9200000 {
+			compatible = "arm,mali-t820", "arm,mali-midgard";
+			reg = <0xc9200000 0x4000>;
+			interrupts = <GIC_SPI 94 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 95 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 93 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "job", "mmu", "gpu";
+			clocks = <&gpuclk>;
+			clock-names = "core";
 		};
 	};
 
