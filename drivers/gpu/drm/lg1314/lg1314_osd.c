@@ -73,6 +73,7 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 {
 	u32 hdr[7];
 	u32 wpl = pitch >> 3;
+	u32 scaler, want;
 	int i;
 
 	hdr[0] = 0;						/* ypos | xpos<<16 | ckey_en */
@@ -89,6 +90,18 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 
 	for (i = 0; i < 7; i++)
 		lg1314_wr(lg, OSD0_REG(OSD_CTRL_HDR0 + i * 4), hdr[i]);
+
+	/*
+	 * Buffer mode lets the OSD use scaler memory as extra line memory for
+	 * an unscaled (1:1) plane; without it a 3840-wide plane shows the left
+	 * part, a gap, then a duplicate. The bit is active-low: clear it for a
+	 * 1:1 plane, leave it set when scaling. Only written on change.
+	 */
+	scaler = lg1314_rd(lg, OSD0_REG(OSD_CTRL_SCALER));
+	want = w == LG1314_PANEL_W ? scaler & ~OSD_SCALER_BUF_MODE_EN_N
+				   : scaler | OSD_SCALER_BUF_MODE_EN_N;
+	if (want != scaler)
+		lg1314_wr(lg, OSD0_REG(OSD_CTRL_SCALER), want);
 
 	lg1314_wr(lg, OSD0_REG(OSD_CTRL_MAIN),
 		  lg1314_rd(lg, OSD0_REG(OSD_CTRL_MAIN)) | OSD_HDR_READY);

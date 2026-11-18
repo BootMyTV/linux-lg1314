@@ -37,6 +37,8 @@ struct lg1314_mmio {
 #define OSD_TOP_PHYS			0xc9010000
 #define OSD0_CTRL_BASE			0x200		/* osdx_ctrl[0] */
 #define OSD_CTRL_MAIN			0x00		/* osd_en = BIT(0), ready = BIT(29) */
+#define OSD_CTRL_SCALER			0x10
+#define OSD_SCALER_BUF_MODE_EN_N	BIT(6)		/* reg_osd_buf_mode_en_n */
 #define OSD_CTRL_HDR0			0x20		/* 7 consecutive u32: hdr0..hdr6 */
 #define OSD_CTRL_SYNC0			0x40		/* osd_sync_enable = BIT(0) */
 #define OSD_EN				BIT(0)

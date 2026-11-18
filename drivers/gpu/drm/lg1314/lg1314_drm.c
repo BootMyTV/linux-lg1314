@@ -158,6 +158,14 @@ static const struct drm_simple_display_pipe_funcs lg1314_pipe_funcs = {
  * VX1 table.
  */
 static const struct drm_display_mode lg1314_modes[] = {
+	/*
+	 * Native 4K plane (1:1, OSD buffer mode). NB: slips lines under heavy
+	 * memory traffic (OSD fetch starved on LBUS); see cfw/4k-osd.md.
+	 */
+	{ DRM_MODE("3840x2160", DRM_MODE_TYPE_DRIVER,
+		 594000, 3840, 4016, 4104, 4400, 0,
+		 2160, 2168, 2178, 2250, 0,
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
 	{ DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 		 148500, 1920, 2008, 2052, 2200, 0,
 		 1080, 1084, 1089, 1125, 0,
@@ -227,9 +235,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 		return ret;
 
 	drm->mode_config.min_width = LG1314_FB_MIN_W;
-	drm->mode_config.max_width = LG1314_FB_W;
+	drm->mode_config.max_width = LG1314_PANEL_W;
 	drm->mode_config.min_height = LG1314_FB_MIN_H;
-	drm->mode_config.max_height = LG1314_FB_H;
+	drm->mode_config.max_height = LG1314_PANEL_H;
 	drm->mode_config.funcs = &lg1314_mode_config_funcs;
 
 	drm_connector_helper_add(&lg->connector, &lg1314_conn_helper_funcs);
