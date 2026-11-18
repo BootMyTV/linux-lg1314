@@ -194,15 +194,17 @@ static const struct clk_ops lg1k_pll_ops = {
 /*
  * GPU PLL (CTOP_DPE gpupll). Unscrambled window (no 'fix' mask); same field
  * layout as the CPU PLL but the feedback divider divides by M directly (not
- * M+1). The boot firmware leaves it at ~660 MHz. set_rate reconfigures it with
- * the vendor cold-boot relock seen in the secureboot SHB 'top' record (write
- * ctrl with spread-spectrum held off via the 'dss' bit, settle, release),
- * bracketed by a park on the gpu_clk_sel mux so the live GPU does not glitch
- * while the PLL relocks (mirrors the CPU PLL's switch-bit park).
+ * M+1). set_rate rewrites ctrl0/ctrl1 bracketed by a park on the gpu_clk_sel
+ * mux so the live GPU does not glitch while the PLL relocks (mirrors the CPU
+ * PLL's switch-bit park).
+ *
+ * ctrl0 bit 2 disables spread spectrum. set_rate always sets it: the spread
+ * parameters are not configured, and enabling spread spectrum on this PLL
+ * makes the GPU unstable.
  */
 #define GPU_PLL_CTRL0		0x00	/* CTOP_DPE gpupll word 0 (0xc930a0d8) */
 #define GPU_PLL_CTRL1		0x04	/* CTOP_DPE gpupll word 1 (0xc930a0dc) */
-#define GPU_PLL_DSS		BIT(2)	/* ctrl0: spread spectrum, held off on relock */
+#define GPU_PLL_DSS		BIT(2)	/* ctrl0: spread spectrum disable */
 #define GPU_SEL			BIT(28)	/* gpu_clk_sel: park GPU off gpupll (0xc9c10464) */
 
 struct lg1k_gpu {
@@ -252,16 +254,17 @@ static int lg1k_gpu_set_rate(struct clk_hw *hw, unsigned long rate,
 	/* recalc floors M to 1 and find_ctrl solves for /1; pin M to match. */
 	r[0] &= ~PLL_M;
 
+	/* Keep spread spectrum off. */
+	r[0] |= GPU_PLL_DSS;
+
 	/* Park the GPU on the alternate source while the PLL relocks. */
 	sel = readl_relaxed(gpu->sel);
 	writel_relaxed(sel | GPU_SEL, gpu->sel);
 
-	/* Reconfigure with spread spectrum held off (dss=1), then release. */
-	writel_relaxed(r[0] | GPU_PLL_DSS, gpu->ctrl + GPU_PLL_CTRL0);
+	/* Reconfigure. */
+	writel_relaxed(r[0], gpu->ctrl + GPU_PLL_CTRL0);
 	writel_relaxed(r[1], gpu->ctrl + GPU_PLL_CTRL1);
 	udelay(50);				/* PLL relock */
-	writel_relaxed(r[0] & ~GPU_PLL_DSS, gpu->ctrl + GPU_PLL_CTRL0);
-	udelay(10);
 
 	/* Unpark. */
 	writel_relaxed(sel & ~GPU_SEL, gpu->sel);

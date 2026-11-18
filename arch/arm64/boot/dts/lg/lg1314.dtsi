@@ -416,7 +416,13 @@
 			interrupt-names = "job", "mmu", "gpu";
 			clocks = <&clkc LG1314_CLK_GPU>;
 			clock-names = "core";
-			operating-points-v2 = <&gpu_opp_table>;
+			/*
+			 * GPU frequency scaling is broken: changing the gpupll rate
+			 * at runtime corrupts GPU rendering and causes job/MMU
+			 * faults. Leave the OPP table unreferenced so devfreq stays
+			 * off and the GPU stays at its 660 MHz boot rate.
+			 */
+			/* operating-points-v2 = <&gpu_opp_table>; */
 
 			/*
 			 * Freq-only OPPs (no opp-microvolt -> no regulator): lets
