@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: ISC
+config MT7668U
+	tristate "MediaTek MT7668U (USB) support"
+	select MT76_USB
+	select MT76_CONNAC_LIB
+	depends on MAC80211
+	depends on USB
+	help
+	  This adds support for the Wi-Fi function of MT7668U 802.11ac 2x2:2
+	  Wi-Fi/Bluetooth combo devices.
+
+	  To compile this driver as a module, choose M here.

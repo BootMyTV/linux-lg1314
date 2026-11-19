@@ -471,6 +471,17 @@ static const struct {
 	{ 0x13d3, 0x3588 },	/* ASUS ROG STRIX X870E-E */
 };
 
+/*
+ * Likewise, some MT7668 boards (e.g. the combo in LG OLED TVs) return 0x0000
+ * from the chip ID register, so fall back to 0x7668 by USB ID.
+ */
+static const struct {
+	u16 vendor;
+	u16 product;
+} btmtk_mt7668_devs[] = {
+	{ 0x043e, 0x3109 },	/* LGE (MT7668 in LG OLED TVs) */
+};
+
 static void btmtk_usb_wmt_recv(struct urb *urb)
 {
 	struct hci_dev *hdev = urb->context;
@@ -701,10 +712,23 @@ static int btmtk_usb_hci_wmt_sync(struct hci_dev *hdev,
 
 	switch (wmt_evt->whdr.op) {
 	case BTMTK_WMT_SEMAPHORE:
-		if (wmt_evt->whdr.flag == 2)
+		/*
+		 * 0: not downloaded, the semaphore is held elsewhere (the
+		 *    other function of a combo chip shares the patch)
+		 * 1: already downloaded
+		 * 2: not downloaded, semaphore acquired
+		 */
+		switch (wmt_evt->whdr.flag) {
+		case 0:
+			status = BTMTK_WMT_PATCH_PROGRESS;
+			break;
+		case 2:
 			status = BTMTK_WMT_PATCH_UNDONE;
-		else
+			break;
+		default:
 			status = BTMTK_WMT_PATCH_DONE;
+			break;
+		}
 		break;
 	case BTMTK_WMT_FUNC_CTRL:
 		if (!skb_pull_data(data->evt_skb,
@@ -1319,7 +1343,7 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 	unsigned long long duration;
 	struct sk_buff *skb;
 	const char *fwname;
-	int err, status;
+	int err, status, retry;
 	u32 dev_id = 0;
 	char fw_bin_name[64];
 	u32 fw_version = 0, fw_flavor = 0;
@@ -1365,9 +1389,17 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 			}
 		}
 
+		for (i = 0; !dev_id && i < ARRAY_SIZE(btmtk_mt7668_devs); i++) {
+			if (vid == btmtk_mt7668_devs[i].vendor &&
+			    pid == btmtk_mt7668_devs[i].product) {
+				dev_id = 0x7668;
+				break;
+			}
+		}
+
 		if (dev_id)
-			bt_dev_info(hdev, "MT6639: CHIPID=0x0000 with VID=%04x PID=%04x, using 0x6639",
-				    vid, pid);
+			bt_dev_info(hdev, "CHIPID=0x0000 with VID=%04x PID=%04x, using 0x%04x",
+				    vid, pid, dev_id);
 	}
 
 	btmtk_data->dev_id = dev_id;
@@ -1382,6 +1414,14 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 		break;
 	case 0x7668:
 		fwname = FIRMWARE_MT7668;
+		/*
+		 * Advertises LE Data Length Extension and Get MWS Transport
+		 * Layer Configuration, but rejects those commands; supports the
+		 * basic LE commands but doesn't list them.
+		 */
+		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LE_DATA_LEN_EXT);
+		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
+		hci_set_quirk(hdev, HCI_QUIRK_MISSING_LE_COMMANDS);
 		break;
 	case 0x7922:
 	case 0x7925:
@@ -1452,10 +1492,17 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 	wmt_params.data = NULL;
 	wmt_params.status = &status;
 
-	err = btmtk_usb_hci_wmt_sync(hdev, &wmt_params);
-	if (err < 0) {
-		bt_dev_err(hdev, "Failed to query firmware status (%d)", err);
-		return err;
+	/* the other function may be downloading the shared patch */
+	for (retry = 0; retry < 50; retry++) {
+		err = btmtk_usb_hci_wmt_sync(hdev, &wmt_params);
+		if (err < 0) {
+			bt_dev_err(hdev, "Failed to query firmware status (%d)",
+				   err);
+			return err;
+		}
+		if (status != BTMTK_WMT_PATCH_PROGRESS)
+			break;
+		msleep(100);
 	}
 
 	if (status == BTMTK_WMT_PATCH_DONE) {
@@ -1466,8 +1513,15 @@ int btmtk_usb_setup(struct hci_dev *hdev)
 	/* Setup a firmware which the device definitely requires */
 	err = btmtk_setup_firmware(hdev, fwname,
 				   btmtk_usb_hci_wmt_sync);
-	if (err < 0)
+	if (err < 0) {
+		/* don't leave the patch semaphore taken */
+		if (status == BTMTK_WMT_PATCH_UNDONE) {
+			wmt_params.flag = 0;
+			wmt_params.status = NULL;
+			btmtk_usb_hci_wmt_sync(hdev, &wmt_params);
+		}
 		return err;
+	}
 
 ignore_setup_fw:
 	err = readx_poll_timeout(btmtk_usb_func_query, hdev, status,

@@ -378,6 +378,31 @@ enum {
 	 */
 	HCI_QUIRK_BROKEN_READ_PAGE_SCAN_TYPE,
 
+	/*
+	 * When this quirk is set, the HCI_OP_LE_READ_MAX_DATA_LEN,
+	 * HCI_OP_LE_READ_DEF_DATA_LEN and HCI_OP_LE_WRITE_DEF_DATA_LEN commands
+	 * are skipped. This is required for the MediaTek MT7668, which
+	 * advertises the LE Data Length Extension feature but errors out on
+	 * those commands (e.g. "Opcode 0x202f failed"), aborting init.
+	 *
+	 * This quirk can be set before hci_register_dev is called or during
+	 * the hdev->setup vendor callback.
+	 */
+	HCI_QUIRK_BROKEN_LE_DATA_LEN_EXT,
+
+	/*
+	 * When this quirk is set, the Bluetooth 4.0 LE commands (octets 25 to
+	 * 28 of the supported commands) are assumed to be supported even if
+	 * the controller leaves them out of its Read Local Supported Commands
+	 * response. This is required for the MediaTek MT7668, which reports
+	 * none of them; without them no LE events are enabled and LE scanning
+	 * returns no results.
+	 *
+	 * This quirk can be set before hci_register_dev is called or during
+	 * the hdev->setup vendor callback.
+	 */
+	HCI_QUIRK_MISSING_LE_COMMANDS,
+
 	__HCI_NUM_QUIRKS,
 };
 

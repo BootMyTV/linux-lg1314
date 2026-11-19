@@ -2792,6 +2792,7 @@ static int btusb_recv_event_realtek(struct hci_dev *hdev, struct sk_buff *skb)
 
 static void btusb_mtk_claim_iso_intf(struct btusb_data *data)
 {
+	struct usb_endpoint_descriptor *int_in, *int_out;
 	struct btmtk_data *btmtk_data;
 	int err;
 
@@ -2804,6 +2805,17 @@ static void btusb_mtk_claim_iso_intf(struct btusb_data *data)
 
 	if (!btmtk_data->isopkt_intf) {
 		bt_dev_err(data->hdev, "Can't claim NULL iso interface");
+		return;
+	}
+
+	/*
+	 * ISO data goes over a pair of interrupt endpoints. On older combo
+	 * chips (e.g. MT7663/MT7668) the interface at MTK_ISO_IFNUM is the
+	 * WLAN function instead, with only bulk endpoints; leave it alone.
+	 */
+	if (usb_find_common_endpoints(btmtk_data->isopkt_intf->cur_altsetting,
+				      NULL, NULL, &int_in, &int_out)) {
+		btmtk_data->isopkt_intf = NULL;
 		return;
 	}
 

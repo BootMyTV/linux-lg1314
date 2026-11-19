@@ -946,6 +946,21 @@ mt76u_ac_to_hwq(struct mt76_dev *dev, struct mt76_queue *q, u8 qid)
 		q->ep = q->hw_idx + 1;
 		break;
 	}
+	case 0x7668: {
+		static const u8 lmac_queue_map[] = {
+			/* ac to lmac mapping */
+			[IEEE80211_AC_BK] = 0,
+			[IEEE80211_AC_BE] = 1,
+			[IEEE80211_AC_VI] = 2,
+			[IEEE80211_AC_VO] = 3,
+		};
+
+		/* data on bulk-out 1-4, management with MCU commands */
+		q->hw_idx = lmac_queue_map[ac];
+		q->ep = qid == MT_TXQ_PSD ? MT_EP_OUT_INBAND_CMD :
+					    q->hw_idx + 1;
+		break;
+	}
 	case 0x7961:
 	case 0x7925:
 		q->hw_idx = mt76_ac_to_hwq(ac);

@@ -796,6 +796,14 @@ static u8 hci_cc_read_local_commands(struct hci_dev *hdev, void *data,
 	    hci_dev_test_flag(hdev, HCI_CONFIG))
 		memcpy(hdev->commands, rp->commands, sizeof(hdev->commands));
 
+	/* Bluetooth 4.0 LE commands the controller doesn't report */
+	if (hci_test_quirk(hdev, HCI_QUIRK_MISSING_LE_COMMANDS)) {
+		hdev->commands[25] |= 0xf7;
+		hdev->commands[26] |= 0xff;
+		hdev->commands[27] |= 0xff;
+		hdev->commands[28] |= 0x7f;
+	}
+
 	return rp->status;
 }
 

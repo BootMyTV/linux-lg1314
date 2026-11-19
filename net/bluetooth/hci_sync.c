@@ -4666,7 +4666,8 @@ static int hci_le_set_rpa_timeout_sync(struct hci_dev *hdev)
 /* Read LE Maximum Data Length */
 static int hci_le_read_max_data_len_sync(struct hci_dev *hdev)
 {
-	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT))
+	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT) ||
+	    hci_test_quirk(hdev, HCI_QUIRK_BROKEN_LE_DATA_LEN_EXT))
 		return 0;
 
 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_READ_MAX_DATA_LEN, 0, NULL,
@@ -4676,7 +4677,8 @@ static int hci_le_read_max_data_len_sync(struct hci_dev *hdev)
 /* Read LE Suggested Default Data Length */
 static int hci_le_read_def_data_len_sync(struct hci_dev *hdev)
 {
-	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT))
+	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT) ||
+	    hci_test_quirk(hdev, HCI_QUIRK_BROKEN_LE_DATA_LEN_EXT))
 		return 0;
 
 	return __hci_cmd_sync_status(hdev, HCI_OP_LE_READ_DEF_DATA_LEN, 0, NULL,
@@ -4965,7 +4967,8 @@ static int hci_le_set_write_def_data_len_sync(struct hci_dev *hdev)
 {
 	struct hci_cp_le_write_def_data_len cp;
 
-	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT))
+	if (!(hdev->le_features[0] & HCI_LE_DATA_LEN_EXT) ||
+	    hci_test_quirk(hdev, HCI_QUIRK_BROKEN_LE_DATA_LEN_EXT))
 		return 0;
 
 	memset(&cp, 0, sizeof(cp));
