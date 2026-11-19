@@ -215,20 +215,18 @@
 			#thermal-sensor-cells = <0>;
 		};
 
-		mmc@c3600000 {
+		emmc: mmc@c3600000 {
 			compatible = "lge,lg1k-sdhci-5.0-v3";
 			reg = <0xc3600000 0x1000>, <0xc3680000 0x1000>;
 			interrupts = <GIC_SPI 88 IRQ_TYPE_LEVEL_HIGH>;
 			clock-frequency = <195000000>;
-			tab-delay = <0x153519a6>;
-			device-ds = <0x00>;
-			tab-offset = <0x10>;
-			dll-offset = <0x60>;
-			dllrdy-offset = <0x4c>;
-			delaycell-offset = <0x6c>;
-			delaycell-50Mhz = <0x00>;
-			delaycell-200Mhz = <0x00>;
-			hw-autotune = <0x00>;
+			bus-width = <8>;
+			non-removable;
+			no-sd;
+			no-sdio;
+			cap-mmc-highspeed;
+			mmc-hs200-1_8v;
+			mmc-hs400-1_8v;
 		};
 
 		sdcard@ff000000 {

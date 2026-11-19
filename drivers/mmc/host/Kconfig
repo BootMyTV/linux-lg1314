@@ -264,6 +264,17 @@ config MMC_SDHCI_OF_K1
 
 	  If unsure, say N.
 
+config MMC_SDHCI_LG1K
+	tristate "SDHCI support for LG lg1k eMMC host"
+	depends on MMC_SDHCI_PLTFM
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on OF
+	help
+	  This selects the eMMC 5.0 host controller found in LG lg1k-family
+	  DTV SoCs such as the LG1314.
+
+	  If unsure, say N.
+
 config MMC_SDHCI_OF_SPARX5
 	tristate "SDHCI OF support for the MCHP Sparx5 SoC"
 	depends on MMC_SDHCI_PLTFM

@@ -75,3 +75,10 @@
 		reg = <0x29>;
 	};
 };
+
+&emmc {
+	lge,otap-del-sel-mmc-hs = <6>;
+	lge,itap-del-sel-mmc-hs = <26>;
+	lge,otap-del-sel-hs200 = <6>;
+	lge,otap-del-sel-hs400 = <3>;
+};
