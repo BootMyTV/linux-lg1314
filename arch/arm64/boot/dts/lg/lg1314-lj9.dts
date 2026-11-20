@@ -19,6 +19,26 @@
 
 	chosen {
 		stdout-path = "serial0:115200n8";
+		/* Reserved, fixed-size slots the boot firmware patches in place (no libfdt).
+		 * bootargs: 256 bytes (255 chars + NUL). initrd addrs: 8 bytes each. */
+		bootargs = "                                                                                                                                                                                                                                                               ";
+		linux,initrd-start = <0x0 0x0>;
+		linux,initrd-end = <0x0 0x0>;
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* OSD0 scanout left live by the boot firmware (linear, 1080p,
+		 * upscaled to the panel). Inside kdrv_buffer1, so already no-map. */
+		framebuffer@78602000 {
+			compatible = "simple-framebuffer";
+			reg = <0x78602000 0x7e9000>;
+			width = <1920>;
+			height = <1080>;
+			stride = <7680>;
+			format = "a8r8g8b8";
+		};
 	};
 
 	memory@0 {

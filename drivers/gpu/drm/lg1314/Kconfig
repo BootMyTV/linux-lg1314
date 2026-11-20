@@ -3,6 +3,7 @@ config DRM_LG1314
 	tristate "DRM support for LG1314 OLED display"
 	depends on DRM && OF
 	depends on ARCH_LG1K || COMPILE_TEST
+	select APERTURE_HELPERS
 	select DRM_CLIENT_SELECTION
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER

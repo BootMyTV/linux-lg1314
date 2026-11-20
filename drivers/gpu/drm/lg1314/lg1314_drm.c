@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* DRM/KMS driver for the LG1314 display pipeline (LG OLED55B9PLA). */
 
+#include <linux/aperture.h>
 #include <linux/dma-mapping.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
@@ -335,6 +336,17 @@ static int lg1314_probe(struct platform_device *pdev)
 	lg->chpower_save = lg1314_rd(lg, LG1314_OVI_CHPOWER_REG);
 
 	ret = lg1314_init_mode_config(lg);
+	if (ret)
+		goto err_micom;
+
+	/*
+	 * Evict any firmware framebuffer before we take over the display.
+	 * lxboot leaves the OSD scanning out a linear buffer that the boot
+	 * DT can expose as a simple-framebuffer (driven by simpledrm/fbcon);
+	 * that buffer lives apart from our scanout pool, so remove all
+	 * conflicting framebuffers by name rather than by our own aperture.
+	 */
+	ret = aperture_remove_all_conflicting_devices(lg1314_drm_driver.name);
 	if (ret)
 		goto err_micom;
 
