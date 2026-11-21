@@ -9,6 +9,7 @@
 
 #include <linux/types.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <drm/drm_device.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_connector.h>
@@ -108,6 +109,7 @@ struct lg1314_mmio {
 #define DE_IPC_ADR5_HI			0x2c
 #define DE_IPC_CTRL_HOLD		BIT(0)
 #define DE_IPC_CTRL_B1			BIT(1)
+#define DE_IPC_TAG			0x100	/* memory layout table, read by the firmware */
 #define DE_FW_DDR_MIN			0x50000000u	/* ADR5 must be >= this */
 #define DE_FW_NAME			"lg1314/de_fw.bin"
 
@@ -134,9 +136,20 @@ struct lg1314_drm {
 	/* panel power sequencing */
 	struct i2c_client		*micom;
 
-	/* Fixed DE firmware region (its embedded pointers assume this base). */
+	/* DE firmware image, and the memory layout handed to it. */
 	phys_addr_t			de_fw_phys;
 	size_t				de_fw_size;
+	struct lg1314_de_mem {
+		struct resource		fw_m0;	/* firmware shared/working memory */
+		struct resource		prew;	/* pre-write + FRC buffers */
+		struct resource		hdr;
+		struct resource		frm;	/* frame buffers */
+		struct resource		vt;	/* VTG buffers */
+		struct resource		be;	/* back end */
+		struct resource		vdec_dpb;
+		struct resource		scanout;
+		u32			model;
+	} de_mem;
 
 	/* channel-power register value preserved from lxboot at probe */
 	u32				chpower_save;

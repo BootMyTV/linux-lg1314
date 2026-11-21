@@ -48,49 +48,109 @@
 		      <0xaf000000 0x11000000>;
 	};
 
+	/*
+	 * kdrv_buffer1 (0x4f400000-0x80000000) and kdrv_buffer2
+	 * (0xaf000000-0xc0000000) are reserved whole, as by the stock firmware,
+	 * and split into the stock platform's regions: the display and decode
+	 * firmware are given (or assume) these addresses.
+	 */
 	reserved-memory {
 		#address-cells = <1>;
 		#size-cells = <1>;
 		ranges;
 
-		/*
-		 * The DE firmware embeds absolute DDR pointers; its image and
-		 * working buffers must sit at their expected base (0x50000000,
-		 * spanning to ~0x554b0568). Reserve it fixed and keep scanout out.
-		 */
-		de_fw: de-fw@50000000 {
-			reg = <0x50000000 0x06000000>;
-			no-map;
-		};
-
-		/* Scanout DMA pool, clear of the DE firmware region. */
-		display_pool: display-pool@56000000 {
+		/* Video decoder: decoded pictures. A CMA area (lent to Linux while
+		 * unused) so the frames can be shared as dma-bufs. */
+		vdec_dpb: vdec-dpb@4f400000 {
 			compatible = "shared-dma-pool";
-			reg = <0x56000000 0x08000000>;
+			reg = <0x4f400000 0x13c00000>;
+			reusable;
+		};
+
+		/* Video decoder: stream buffers (24 MiB), then the decode
+		 * coprocessor's own pool (IPC area, firmware image, ...). */
+		vdec_mcu: vdec-mcu@63000000 {
+			reg = <0x63000000 0x02c00000>;
 			no-map;
 		};
 
-		vdec_pool: kdrv_buffer1@5e000000 {
+		/* Graphics surfaces: the scanout DMA pool. */
+		gfx_surface: gfx-surface@65c00000 {
+			compatible = "shared-dma-pool";
+			reg = <0x65c00000 0x07c00000>;
 			no-map;
-			reg = <0x5e000000 0x22000000>;
 		};
 
-		kdrv_buffer2@af000000 {
+		kdrv-misc@6d800000 {
+			reg = <0x6d800000 0x00b00000>;
 			no-map;
-			reg = <0xaf000000 0x11000000>;
+		};
+
+		/* Display engine: shared/working memory of its firmware. */
+		de_fw_m0: de-fw-m0@6e300000 {
+			reg = <0x6e300000 0x00100000>;
+			no-map;
+		};
+
+		/* Display engine: pre-write + frame-rate-conversion buffers. */
+		de_prew: de-prew@6e400000 {
+			reg = <0x6e400000 0x08a00000>;
+			no-map;
+		};
+
+		de_hdr: de-hdr@76e00000 {
+			reg = <0x76e00000 0x00300000>;
+			no-map;
+		};
+
+		/* Includes the boot firmware's live scanout (framebuffer@78602000). */
+		kdrv-misc@77100000 {
+			reg = <0x77100000 0x08f00000>;
+			no-map;
+		};
+
+		/* Display engine firmware image. */
+		de_fw: de-fw@af000000 {
+			reg = <0xaf000000 0x00400000>;
+			no-map;
+		};
+
+		/* Display engine: frame buffers. */
+		de_frm: de-frm@af400000 {
+			reg = <0xaf400000 0x09400000>;
+			no-map;
+		};
+
+		/* Display engine: VTG buffers. */
+		de_vt: de-vt@b8800000 {
+			reg = <0xb8800000 0x02400000>;
+			no-map;
+		};
+
+		/* Back end and other blocks' memory. */
+		kdrv_be: kdrv-be@bac00000 {
+			reg = <0xbac00000 0x05400000>;
+			no-map;
 		};
 	};
 
 	display: display-subsystem {
 		compatible = "lge,lg1314-drm";
-		memory-region = <&display_pool>, <&de_fw>;
-		memory-region-names = "scanout", "de-fw";
+		memory-region = <&gfx_surface>, <&de_fw>, <&de_fw_m0>, <&de_prew>,
+				<&de_hdr>, <&de_frm>, <&de_vt>, <&kdrv_be>,
+				<&vdec_dpb>;
+		memory-region-names = "scanout", "de-fw", "de-fw-m0", "de-prew",
+				      "de-hdr", "de-frm", "de-vt", "be",
+				      "vdec-dpb";
+		/* Model word for the DE firmware (from the board's hwopt). */
+		lge,de-model = <0x00020001>;
 		lge,micom = <&micom>;
 	};
 
 	vdec: vdec {
 		compatible = "lge,lg1314-vdec";
-		memory-region = <&vdec_pool>;
+		memory-region = <&vdec_mcu>, <&vdec_dpb>;
+		memory-region-names = "mcu", "dpb";
 		interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
 	};
 };

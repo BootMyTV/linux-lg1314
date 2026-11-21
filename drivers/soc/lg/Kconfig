@@ -5,12 +5,31 @@ menu "LG SoC drivers"
 config LG1314_VDEC
 	tristate "LG1314 video-decode coprocessor"
 	depends on ARCH_LG1K || COMPILE_TEST
-	depends on OF
+	depends on OF && HAS_DMA
+	depends on VIDEO_DEV
+	select GENERIC_ALLOCATOR
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	select VIDEOBUF2_VMALLOC
 	help
-	  Bring-up driver for the Xtensa video-decode coprocessor on the
-	  LG1314 TV SoC: loads the decode firmware into a reserved DRAM
-	  carveout and releases the coprocessor from reset.
+	  Driver for the Xtensa video-decode coprocessor on the LG1314 TV
+	  SoC: loads the decode firmware into a reserved DRAM carveout,
+	  boots the coprocessor, and talks to it over a shared-memory
+	  mailbox. Provides a V4L2 stateful (memory-to-memory) video
+	  decoder, and the firmware's console as /dev/ttyLXIPC0.
 
 	  Say Y here to enable hardware video decode on LG1314-based TVs.
+
+config LG1314_VDEC_PASSTHROUGH
+	bool "Raw decoder interface (development only)"
+	depends on LG1314_VDEC
+	help
+	  Adds /dev/lxvdec, which forwards the firmware's own decoder
+	  commands from userspace unchanged and maps its stream and
+	  notification buffers. This is a development aid for working out
+	  the firmware's decode protocol; it is not a stable interface and
+	  gives root direct control of the decoder.
+
+	  If unsure, say N.
 
 endmenu

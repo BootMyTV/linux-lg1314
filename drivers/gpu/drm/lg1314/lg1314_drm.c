@@ -258,23 +258,55 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 	return 0;
 }
 
-static int lg1314_get_de_fw_region(struct lg1314_drm *lg)
+/* A reserved-memory region of ours, by its memory-region-names entry. */
+static int lg1314_get_region(struct lg1314_drm *lg, const char *name,
+			     struct resource *res)
 {
 	struct device_node *np;
-	struct resource res;
+	int idx, ret;
+
+	idx = of_property_match_string(lg->dev->of_node, "memory-region-names", name);
+	if (idx < 0)
+		return dev_err_probe(lg->dev, idx, "missing %s region\n", name);
+	np = of_parse_phandle(lg->dev->of_node, "memory-region", idx);
+	if (!np)
+		return dev_err_probe(lg->dev, -EINVAL, "bad %s region\n", name);
+	ret = of_address_to_resource(np, 0, res);
+	of_node_put(np);
+	return ret;
+}
+
+/* The DE firmware image region and the memory layout handed to the firmware. */
+static int lg1314_get_de_regions(struct lg1314_drm *lg)
+{
+	struct lg1314_de_mem *m = &lg->de_mem;
+	struct resource fw;
 	int ret;
 
-	np = of_parse_phandle(lg->dev->of_node, "memory-region", 1);
-	if (!np)
-		return dev_err_probe(lg->dev, -EINVAL, "missing de-fw region\n");
-
-	ret = of_address_to_resource(np, 0, &res);
-	of_node_put(np);
+	ret = lg1314_get_region(lg, "de-fw", &fw);
+	if (!ret)
+		ret = lg1314_get_region(lg, "de-fw-m0", &m->fw_m0);
+	if (!ret)
+		ret = lg1314_get_region(lg, "de-prew", &m->prew);
+	if (!ret)
+		ret = lg1314_get_region(lg, "de-hdr", &m->hdr);
+	if (!ret)
+		ret = lg1314_get_region(lg, "de-frm", &m->frm);
+	if (!ret)
+		ret = lg1314_get_region(lg, "de-vt", &m->vt);
+	if (!ret)
+		ret = lg1314_get_region(lg, "be", &m->be);
+	if (!ret)
+		ret = lg1314_get_region(lg, "vdec-dpb", &m->vdec_dpb);
+	if (!ret)
+		ret = lg1314_get_region(lg, "scanout", &m->scanout);
 	if (ret)
 		return ret;
+	if (of_property_read_u32(lg->dev->of_node, "lge,de-model", &m->model))
+		return dev_err_probe(lg->dev, -EINVAL, "missing lge,de-model\n");
 
-	lg->de_fw_phys = res.start;
-	lg->de_fw_size = resource_size(&res);
+	lg->de_fw_phys = fw.start;
+	lg->de_fw_size = resource_size(&fw);
 	return 0;
 }
 
@@ -327,8 +359,8 @@ static int lg1314_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "no scanout memory region\n");
 
-	/* The DE firmware region (idx 1) is fixed at its embedded base. */
-	ret = lg1314_get_de_fw_region(lg);
+	/* The DE firmware image and working-memory regions. */
+	ret = lg1314_get_de_regions(lg);
 	if (ret)
 		goto err_micom;
 
