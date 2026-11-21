@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "LG SoC drivers"
+
+config LG1314_VDEC
+	tristate "LG1314 video-decode coprocessor"
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on OF
+	help
+	  Bring-up driver for the Xtensa video-decode coprocessor on the
+	  LG1314 TV SoC: loads the decode firmware into a reserved DRAM
+	  carveout and releases the coprocessor from reset.
+
+	  Say Y here to enable hardware video decode on LG1314-based TVs.
+
+endmenu

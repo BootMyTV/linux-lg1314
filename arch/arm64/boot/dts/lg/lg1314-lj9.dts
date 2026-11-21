@@ -70,7 +70,7 @@
 			no-map;
 		};
 
-		kdrv_buffer1@5e000000 {
+		vdec_pool: kdrv_buffer1@5e000000 {
 			no-map;
 			reg = <0x5e000000 0x22000000>;
 		};
@@ -86,6 +86,12 @@
 		memory-region = <&display_pool>, <&de_fw>;
 		memory-region-names = "scanout", "de-fw";
 		lge,micom = <&micom>;
+	};
+
+	vdec: vdec {
+		compatible = "lge,lg1314-vdec";
+		memory-region = <&vdec_pool>;
+		interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
 	};
 };
 

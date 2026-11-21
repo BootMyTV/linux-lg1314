@@ -269,6 +269,7 @@ config MMC_SDHCI_LG1K
 	depends on MMC_SDHCI_PLTFM
 	depends on ARCH_LG1K || COMPILE_TEST
 	depends on OF
+	select MMC_SDHCI_IO_ACCESSORS
 	help
 	  This selects the eMMC 5.0 host controller found in LG lg1k-family
 	  DTV SoCs such as the LG1314.
