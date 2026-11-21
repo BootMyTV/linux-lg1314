@@ -1652,6 +1652,17 @@ config MFD_TI_AM335X_TSCADC
 	  To compile this driver as a module, choose M here: the
 	  module will be called ti_am335x_tscadc.
 
+config MFD_LG1314_MICOM
+	tristate "LG1314 standby MICOM"
+	depends on ARCH_LG1K || COMPILE_TEST
+	depends on I2C && OF
+	select MFD_CORE
+	help
+	  Support for the standby microcontroller (MICOM) of LG1314-based
+	  TVs, on I2C. The core driver switches the on-board Wi-Fi/Bluetooth
+	  combo's power and reset; the MICOM's functions (RTC, IR power key)
+	  are child devices with their own drivers.
+
 config MFD_LP3943
 	tristate "TI/National Semiconductor LP3943 MFD Driver"
 	depends on I2C

@@ -190,6 +190,16 @@ config INPUT_PCSPKR
 	  To compile this driver as a module, choose M here: the
 	  module will be called pcspkr.
 
+config INPUT_LG1314_MICOM_PWRKEY
+	tristate "LG1314 standby MICOM IR power key"
+	depends on MFD_LG1314_MICOM
+	help
+	  Say Y here to get the IR remote's power key, received by the
+	  standby microcontroller (MICOM) of LG1314-based TVs, as KEY_POWER.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called lg1314-micom-pwrkey.
+
 config INPUT_PM8941_PWRKEY
 	tristate "Qualcomm PM8941 power key support"
 	depends on MFD_SPMI_PMIC
