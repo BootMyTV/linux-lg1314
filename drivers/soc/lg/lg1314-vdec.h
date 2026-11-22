@@ -13,6 +13,7 @@
 struct device;
 struct lg1314_vdec;
 struct lg1314_vdec_pt;
+struct lg1314_dovi_pic;
 
 /* Host->firmware calls (lg1314_vdec_call). */
 enum {
@@ -34,6 +35,8 @@ struct device *lg1314_vdec_device(struct lg1314_vdec *v);
 phys_addr_t lg1314_vdec_copro_to_phys(struct lg1314_vdec *v, u32 addr);
 /* Whether [phys, phys + size) lies in the carveout the firmware can reach. */
 bool lg1314_vdec_in_carveout(struct lg1314_vdec *v, phys_addr_t phys, size_t size);
+void *lg1314_vdec_mem_alloc(struct lg1314_vdec *v, size_t size, u32 *phys);
+void lg1314_vdec_mem_free(struct lg1314_vdec *v, void *va, u32 phys, size_t size);
 /* CPU-readable mapping of part of a decoded frame (dpb pool), or NULL. */
 const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 				  size_t len);
@@ -65,6 +68,9 @@ void lg1314_vdec_dec_dpb_free(void *cookie);
 u32 lg1314_vdec_dec_picture_priv(struct lg1314_vdec_dec *dec, u32 addr,
 				 u32 *addr_c);
 u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c);
+int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
+				 u64 *timestamp, u32 *session,
+				 struct lg1314_dovi_pic *pic);
 /* Around looking a picture up and handing it to the video output (reader),
  * or closing a decoder session, which frees its pictures (@closing). */
 void lg1314_vdec_pictures_lock(struct lg1314_vdec *v, bool closing);

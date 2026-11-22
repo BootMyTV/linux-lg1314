@@ -44,6 +44,8 @@ static const struct {
 	[LG1314_REG_DPE]    = { 0xc9020000, 0x1000 },
 	[LG1314_REG_PLL]    = { 0xc9c10000, 0x1000 },
 	[LG1314_REG_IMX]    = { IMX_PHYS, 0x100 },
+	[LG1314_REG_PE_HDR] = { 0xc9005800, 0x400 },
+	[LG1314_REG_PE_ND]  = { 0xc9003000, 0x2000 },
 };
 
 void __iomem *lg1314_map(struct lg1314_drm *lg, u32 phys)
@@ -297,8 +299,10 @@ static void lg1314_crtc_atomic_enable(struct drm_crtc *crtc,
 		if (ret)
 			goto err_ovi;
 		lg->de_fw_loaded = true;
-		if (!lg1314_de_wait_ready(lg))
+		if (!lg1314_de_wait_ready(lg)) {
 			lg1314_de_frame_lock(lg);
+			lg1314_hdr_init(lg);
+		}
 	}
 
 	/* First frame before the panel lights up. */
@@ -354,6 +358,8 @@ static void lg1314_crtc_atomic_flush(struct drm_crtc *crtc,
 {
 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_pending_vblank_event *event;
+
+	lg1314_hdr_commit(to_lg1314(crtc->dev), state);
 
 	spin_lock_irq(&crtc->dev->event_lock);
 	event = cs->event;
@@ -414,6 +420,8 @@ static const struct drm_display_mode lg1314_modes[] = {
 static int lg1314_conn_get_modes(struct drm_connector *connector)
 {
 	int i, count = 0;
+
+	lg1314_hdr_edid(connector);
 
 	for (i = 0; i < ARRAY_SIZE(lg1314_modes); i++) {
 		struct drm_display_mode *mode;
@@ -540,6 +548,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 		return ret;
 	lg->encoder.possible_crtcs = drm_crtc_mask(&lg->crtc);
 	ret = drm_connector_attach_encoder(&lg->connector, &lg->encoder);
+	if (ret)
+		return ret;
+	ret = lg1314_hdr_init_props(lg);
 	if (ret)
 		return ret;
 
@@ -708,6 +719,15 @@ static int lg1314_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_video;
 
+	/* DE IPC (firmware -> host): Dolby Vision record requests */
+	ret = platform_get_irq_optional(pdev, 2);
+	if (ret > 0)
+		ret = lg1314_dovi_init(lg, ret);
+	else if (ret == -ENXIO)
+		ret = 0;
+	if (ret)
+		goto err_video;
+
 	/*
 	 * Evict any firmware framebuffer before we take over the display.
 	 * lxboot leaves the OSD scanning out a linear buffer that the boot
@@ -728,6 +748,7 @@ static int lg1314_probe(struct platform_device *pdev)
 	return 0;
 
 err_video:
+	lg1314_dovi_fini(lg);
 	lg1314_video_fini(lg);
 err_micom:
 	put_device(&lg->micom->dev);
@@ -740,6 +761,7 @@ static void lg1314_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&lg->drm);
 	drm_atomic_helper_shutdown(&lg->drm);
+	lg1314_dovi_fini(lg);
 	lg1314_video_fini(lg);
 	put_device(&lg->micom->dev);
 }

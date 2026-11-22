@@ -38,6 +38,7 @@
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-vmalloc.h>
 
+#include "lg1314-dovi.h"
 #include "lg1314-vdec.h"
 
 #define DEC_NAME		"lg1314-vdec"
@@ -179,6 +180,12 @@ enum { FW_PIC_I, FW_PIC_P, FW_PIC_B };
 #define FW_SET_OUTPUT_DEVICE	_IO(FW_IOC_TYPE, 26)
 #define FW_GET_CPB_INFO		_IOR(FW_IOC_TYPE, 33, struct fw_buffer_info)
 #define FW_INIT			_IO(FW_IOC_TYPE, 45)
+#define FW_ADD_FLAGS		_IO(FW_IOC_TYPE, 49)
+#define FW_FLAG_DOLBY_VISION	BIT(11)
+#define FW_FLAG_DOVI_BL		BIT(14)	/* the stream is Dolby Vision's base layer */
+
+#define DEC_DOVI_RING		64	/* access units' composer images kept */
+#define DEC_DOVI_RPU_MAX	SZ_64K
 #define FW_EOS			_IO(FW_IOC_TYPE, 47)
 
 #define FW_CODEC_H264		0
@@ -230,6 +237,7 @@ struct dec_slot {
 	u32			shown_gen;	/* in that session */
 	u32			shown_priv;	/* its firmware key (vdec_priv) */
 	u32			shown_c;	/* its chroma (or second part) */
+	s64			shown_uid;	/* its access unit, -1: unknown */
 	struct dec_ctx		*ctx;		/* while vb */
 };
 
@@ -237,6 +245,7 @@ static DEFINE_SPINLOCK(dec_dpb_lock);
 
 static bool dec_zerocopy = true;
 module_param_named(zerocopy, dec_zerocopy, bool, 0644);
+
 MODULE_PARM_DESC(zerocopy, "decode into CAPTURE buffers (else copy pictures into them)");
 
 struct dec_ctx {
@@ -248,6 +257,11 @@ struct dec_ctx {
 	struct v4l2_pix_format_mplane out_fmt;
 	struct v4l2_pix_format_mplane cap_fmt;
 	struct v4l2_rect	visible;
+	/* the stream's colorimetry (VUI), for CAPTURE; else OUTPUT's */
+	struct {
+		bool		valid;
+		u8		colorspace, xfer_func, ycbcr_enc, quantization;
+	}			col;
 	bool			have_geometry;	/* cap_fmt is the stream's */
 	bool			src_change;	/* waiting for CAPTURE setup */
 
@@ -283,6 +297,20 @@ struct dec_ctx {
 
 	/* CAPTURE buffers by index (dec_dpb_lock). */
 	struct dec_slot		*slots[VB2_MAX_FRAME];
+
+	/* Dolby Vision: the first access unit carries an RPU. The session
+	 * is opened as Dolby Vision's, and each access unit's composer image
+	 * kept for the display (by uid). */
+	bool			dovi;
+	bool			open_pending;	/* HEVC: session opened at the first
+						 * access unit, as Dolby Vision's or not */
+	struct dovi_state	*dovi_st;
+	u8			*dovi_buf;	/* an RPU, unescaped */
+	struct dec_dovi_pic {
+		s64		uid;		/* -1: none */
+		u8		profile;
+		struct lg1314_dovi_pic pic;
+	}			*dovi_pics;	/* DEC_DOVI_RING */
 
 	struct work_struct	noti_work;
 	struct delayed_work	retry_work;	/* input queue full */
@@ -380,6 +408,10 @@ struct h264_geometry {
 	struct v4l2_rect visible;
 	u32 dpb_frames;			/* pictures the decoder has to keep */
 	u32 bit_depth;			/* HEVC: luma */
+	/* VUI colour description (ITU-T H.273 codes), if present */
+	bool colour;
+	u8 primaries, transfer, matrix;
+	bool full_range;
 };
 
 static int h264_skip_hrd(struct h264_bits *b)
@@ -538,10 +570,131 @@ static int hevc_skip_ptl(struct h264_bits *b, u32 max_sub_layers_minus1)
 	return 0;
 }
 
+static int hevc_skip_scaling_list_data(struct h264_bits *b)
+{
+	unsigned int size, matrix, i, n;
+	u32 v;
+	s32 sv;
+
+	for (size = 0; size < 4; size++)
+		for (matrix = 0; matrix < 6; matrix += size == 3 ? 3 : 1) {
+			if (h264_bits(b, 1, &v))
+				return -EINVAL;
+			if (!v) {		/* pred_matrix_id_delta */
+				if (h264_ue(b, &v))
+					return -EINVAL;
+				continue;
+			}
+			n = min(64u, 1u << (4 + (size << 1)));
+			if (size > 1 && h264_se(b, &sv))
+				return -EINVAL;
+			for (i = 0; i < n; i++)
+				if (h264_se(b, &sv))
+					return -EINVAL;
+		}
+	return 0;
+}
+
+/* st_ref_pic_set(idx) in an SPS; num_delta[] counts each set's entries. */
+static int hevc_skip_st_rps(struct h264_bits *b, unsigned int idx, u32 *num_delta)
+{
+	u32 v, neg, pos, n = 0;
+	unsigned int j;
+
+	if (idx && h264_bits(b, 1, &v))
+		return -EINVAL;
+	if (idx && v) {			/* inter_ref_pic_set_prediction */
+		if (h264_bits(b, 1, &v) || h264_ue(b, &v))	/* sign, abs delta */
+			return -EINVAL;
+		for (j = 0; j <= num_delta[idx - 1]; j++) {
+			u32 used, use = 0;
+
+			if (h264_bits(b, 1, &used) || (!used && h264_bits(b, 1, &use)))
+				return -EINVAL;
+			if (used || use)
+				n++;
+		}
+		num_delta[idx] = n;
+		return 0;
+	}
+	if (h264_ue(b, &neg) || h264_ue(b, &pos) || neg > 16 || pos > 16)
+		return -EINVAL;
+	for (j = 0; j < neg + pos; j++)
+		if (h264_ue(b, &v) || h264_bits(b, 1, &v))
+			return -EINVAL;
+	num_delta[idx] = neg + pos;
+	return 0;
+}
+
+/*
+ * The rest of an HEVC SPS after sps_max_dec_pic_buffering, up to the VUI's
+ * colour description.
+ */
+static int hevc_parse_vui_colour(struct h264_bits *b, u32 poc_lsb_bits,
+				 struct h264_geometry *g)
+{
+	u32 v, n, num_delta[65];
+	unsigned int i;
+
+	for (i = 0; i < 6; i++)		/* coding/transform block sizes, depths */
+		if (h264_ue(b, &v))
+			return -EINVAL;
+	if (h264_bits(b, 1, &v))	/* scaling_list_enabled */
+		return -EINVAL;
+	if (v && (h264_bits(b, 1, &v) || (v && hevc_skip_scaling_list_data(b))))
+		return -EINVAL;
+	if (h264_bits(b, 1, &v) || h264_bits(b, 1, &v) || h264_bits(b, 1, &v))
+		return -EINVAL;		/* amp, sao, pcm */
+	if (v && (h264_bits(b, 8, &v) || h264_ue(b, &v) || h264_ue(b, &v) ||
+		  h264_bits(b, 1, &v)))
+		return -EINVAL;
+	if (h264_ue(b, &n) || n > 64)	/* num_short_term_ref_pic_sets */
+		return -EINVAL;
+	for (i = 0; i < n; i++)
+		if (hevc_skip_st_rps(b, i, num_delta))
+			return -EINVAL;
+	if (h264_bits(b, 1, &v))	/* long_term_ref_pics_present */
+		return -EINVAL;
+	if (v) {
+		if (h264_ue(b, &n) || n > 32)
+			return -EINVAL;
+		for (i = 0; i < n; i++)
+			if (h264_bits(b, poc_lsb_bits, &v) || h264_bits(b, 1, &v))
+				return -EINVAL;
+	}
+	/* temporal mvp, strong intra smoothing, vui_parameters_present */
+	if (h264_bits(b, 1, &v) || h264_bits(b, 1, &v) || h264_bits(b, 1, &v) || !v)
+		return -EINVAL;
+	if (h264_bits(b, 1, &v))	/* aspect_ratio_info_present */
+		return -EINVAL;
+	if (v && (h264_bits(b, 8, &v) || (v == 255 && h264_bits(b, 32, &v))))
+		return -EINVAL;
+	if (h264_bits(b, 1, &v) || (v && h264_bits(b, 1, &v)))	/* overscan */
+		return -EINVAL;
+	if (h264_bits(b, 1, &v) || !v)	/* video_signal_type_present */
+		return -EINVAL;
+	if (h264_bits(b, 3, &v) || h264_bits(b, 1, &v))	/* format, full range */
+		return -EINVAL;
+	g->full_range = v;
+	if (h264_bits(b, 1, &v) || !v)	/* colour_description_present */
+		return -EINVAL;
+	if (h264_bits(b, 8, &v))
+		return -EINVAL;
+	g->primaries = v;
+	if (h264_bits(b, 8, &v))
+		return -EINVAL;
+	g->transfer = v;
+	if (h264_bits(b, 8, &v))
+		return -EINVAL;
+	g->matrix = v;
+	g->colour = true;
+	return 0;
+}
+
 static int hevc_parse_sps(const u8 *rbsp, size_t len, struct h264_geometry *g)
 {
 	struct h264_bits b = { .buf = rbsp, .len = len };
-	u32 v, subs, chroma, w, h, crop[4] = { 0 }, dpb = 1, cx, cy;
+	u32 v, subs, chroma, w, h, crop[4] = { 0 }, dpb = 1, cx, cy, poc;
 	unsigned int i;
 
 	if (h264_bits(&b, 4, &v) || h264_bits(&b, 3, &subs) || h264_bits(&b, 1, &v) ||
@@ -556,7 +709,7 @@ static int hevc_parse_sps(const u8 *rbsp, size_t len, struct h264_geometry *g)
 			if (h264_ue(&b, &crop[i]))
 				return -EINVAL;
 	/* bit depths, log2_max_pic_order_cnt_lsb, sub_layer_ordering_info */
-	if (h264_ue(&b, &g->bit_depth) || h264_ue(&b, &v) || h264_ue(&b, &v) ||
+	if (h264_ue(&b, &g->bit_depth) || h264_ue(&b, &v) || h264_ue(&b, &poc) ||
 	    h264_bits(&b, 1, &v))
 		return -EINVAL;
 	for (i = v ? 0 : subs; i <= subs; i++) {
@@ -564,6 +717,10 @@ static int hevc_parse_sps(const u8 *rbsp, size_t len, struct h264_geometry *g)
 			return -EINVAL;
 		dpb++;
 	}
+	/* colour description: optional, the geometry stands without it */
+	g->colour = false;
+	if (poc <= 12)
+		hevc_parse_vui_colour(&b, poc + 4, g);
 	if (!w || !h || w > DEC_MAX_W || h > DEC_MAX_H)
 		return -EINVAL;
 	g->bit_depth += 8;
@@ -704,6 +861,9 @@ static int dec_session_open(struct dec_ctx *ctx)
 		ret = dec_fw_ioctl(ctx, FW_SET_OUTPUT_DEVICE, FW_DST_BUFF, NULL);
 	if (!ret)
 		ret = dec_fw_ioctl(ctx, FW_SET_OUTPUT_MEMFMT, 0, &memfmt);
+	if (!ret && ctx->dovi)
+		ret = dec_fw_ioctl(ctx, FW_ADD_FLAGS,
+				   FW_FLAG_DOLBY_VISION | FW_FLAG_DOVI_BL, NULL);
 	if (!ret)
 		ret = dec_fw_ioctl(ctx, FW_INIT, 0, NULL);
 	if (ret)
@@ -835,10 +995,70 @@ static void dec_set_cap_fmt(struct dec_ctx *ctx, u32 width, u32 height)
 	f->height = height;
 	f->field = V4L2_FIELD_NONE;
 	f->num_planes = 1;
-	f->colorspace = ctx->out_fmt.colorspace;
-	f->xfer_func = ctx->out_fmt.xfer_func;
-	f->ycbcr_enc = ctx->out_fmt.ycbcr_enc;
-	f->quantization = ctx->out_fmt.quantization;
+	if (ctx->col.valid) {
+		f->colorspace = ctx->col.colorspace;
+		f->xfer_func = ctx->col.xfer_func;
+		f->ycbcr_enc = ctx->col.ycbcr_enc;
+		f->quantization = ctx->col.quantization;
+	} else {
+		f->colorspace = ctx->out_fmt.colorspace;
+		f->xfer_func = ctx->out_fmt.xfer_func;
+		f->ycbcr_enc = ctx->out_fmt.ycbcr_enc;
+		f->quantization = ctx->out_fmt.quantization;
+	}
+}
+
+/* The VUI colour description (H.273 codes) as V4L2 colorimetry. */
+static void dec_set_colour(struct dec_ctx *ctx, const struct h264_geometry *g)
+{
+	ctx->col.valid = g->colour;
+	if (!g->colour)
+		return;
+	switch (g->primaries) {
+	case 9:
+		ctx->col.colorspace = V4L2_COLORSPACE_BT2020;
+		break;
+	case 5:
+		ctx->col.colorspace = V4L2_COLORSPACE_470_SYSTEM_BG;
+		break;
+	case 6:
+		ctx->col.colorspace = V4L2_COLORSPACE_SMPTE170M;
+		break;
+	case 12:
+		ctx->col.colorspace = V4L2_COLORSPACE_DCI_P3;
+		break;
+	default:
+		ctx->col.colorspace = V4L2_COLORSPACE_REC709;
+		break;
+	}
+	switch (g->transfer) {
+	case 16:
+		ctx->col.xfer_func = V4L2_XFER_FUNC_SMPTE2084;
+		break;
+	case 13:
+		ctx->col.xfer_func = V4L2_XFER_FUNC_SRGB;
+		break;
+	default:
+		ctx->col.xfer_func = V4L2_XFER_FUNC_709;
+		break;
+	}
+	switch (g->matrix) {
+	case 9:
+		ctx->col.ycbcr_enc = V4L2_YCBCR_ENC_BT2020;
+		break;
+	case 10:
+		ctx->col.ycbcr_enc = V4L2_YCBCR_ENC_BT2020_CONST_LUM;
+		break;
+	case 5:
+	case 6:
+		ctx->col.ycbcr_enc = V4L2_YCBCR_ENC_601;
+		break;
+	default:
+		ctx->col.ycbcr_enc = V4L2_YCBCR_ENC_709;
+		break;
+	}
+	ctx->col.quantization = g->full_range ? V4L2_QUANTIZATION_FULL_RANGE :
+						V4L2_QUANTIZATION_LIM_RANGE;
 }
 
 static bool dec_geometry_matches(struct dec_ctx *ctx, const struct fw_decoded *d)
@@ -1112,6 +1332,62 @@ u32 lg1314_vdec_dec_picture_priv(struct lg1314_vdec_dec *dec, u32 addr,
 	return priv;
 }
 
+/*
+ * The display side: a decoder picture's timestamp and, for a Dolby Vision
+ * stream, its composer image and (the return value) the stream's profile;
+ * 0: not a Dolby Vision stream. -ENOENT: not a picture the firmware still
+ * has; -ENODATA: a Dolby Vision picture without a composer image. The
+ * timestamp and @session (the decoder session the picture is from) are set
+ * unless -ENOENT.
+ */
+int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
+				 u64 *timestamp, u32 *session,
+				 struct lg1314_dovi_pic *pic)
+{
+	struct dec_ctx *ctx;
+	unsigned long flags;
+	unsigned int i;
+	int ret = -ENOENT;
+	u8 profile;
+
+	if (!dec)
+		return ret;
+	spin_lock_irqsave(&dec->ctxs_lock, flags);
+	spin_lock(&dec_dpb_lock);
+	list_for_each_entry(ctx, &dec->ctxs, node) {
+		for (i = 0; i < ARRAY_SIZE(ctx->slots) && ret == -ENOENT; i++) {
+			struct dec_slot *sl = ctx->slots[i];
+			struct dec_dovi_pic *p;
+			s64 uid;
+
+			if (!sl || !sl->shown || sl->back || sl->shown_addr != addr ||
+			    sl->shown_gen != ctx->gen || !READ_ONCE(ctx->handle))
+				continue;
+			uid = sl->shown_uid;
+			*timestamp = uid < 0 ? 0 : ctx->ts[uid % DEC_TS_RING];
+			/* this decoder session: the instance and its session count */
+			*session = (u32)(uintptr_t)ctx ^ ctx->gen << 24;
+			ret = ctx->dovi ? -ENODATA : 0;
+			if (uid < 0 || !ctx->dovi_pics)
+				continue;
+			p = &ctx->dovi_pics[uid % DEC_DOVI_RING];
+			if (READ_ONCE(p->uid) != uid)
+				continue;
+			smp_rmb();
+			memcpy(pic, &p->pic, sizeof(p->pic));
+			profile = p->profile;
+			smp_rmb();
+			if (READ_ONCE(p->uid) == uid)
+				ret = profile;
+		}
+		if (ret != -ENOENT)
+			break;
+	}
+	spin_unlock(&dec_dpb_lock);
+	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
+	return ret;
+}
+
 void lg1314_vdec_dec_dpb_failed(struct lg1314_vdec_dec *dec)
 {
 	struct dec_ctx *ctx;
@@ -1195,6 +1471,7 @@ static void dec_deliver(struct dec_ctx *ctx)
 				ctx->slots[index]->shown_addr = f->d.addr_y;
 				ctx->slots[index]->shown_gen = ctx->gen;
 				ctx->slots[index]->shown_priv = f->d.vdec_priv;
+				ctx->slots[index]->shown_uid = dec_picture_uid(ctx, &f->d);
 				ctx->slots[index]->shown_c = f->d.addr_cb;
 			}
 			spin_unlock(&dec_dpb_lock);
@@ -1385,55 +1662,6 @@ static u32 dec_fw_queued(struct dec_ctx *ctx)
 
 /* Copy one access unit into the CPB and hand it to the firmware. fw_lock held. */
 /*
- * HEVC: whether an access unit has NAL units that aren't the base layer's
- * (Dolby Vision's RPU and enhancement layer: types 62 and 63, or a layer id
- * above 0); if so, a copy without them in *@out (*@out_size bytes).
- */
-static int dec_hevc_base_layer(const u8 *data, u32 size, u8 **out, u32 *out_size)
-{
-	u32 i, start, end, n = 0;
-	bool other = false;
-	u8 *buf = NULL;
-
-	for (int pass = 0; pass < 2; pass++) {
-		for (i = 0; i + 4 < size; ) {
-			bool skip;
-
-			if (data[i] || data[i + 1] || data[i + 2] != 1) {
-				i++;
-				continue;
-			}
-			/* a start code, its leading zero byte if 4 bytes long */
-			start = i && !data[i - 1] ? i - 1 : i;
-			for (end = i + 3; end + 2 < size; end++)
-				if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
-					break;
-			if (end + 2 >= size)
-				end = size;
-			skip = (data[i + 3] >> 1 & 0x3f) >= 62 ||
-			       ((data[i + 3] & 1) << 5 | data[i + 4] >> 3);
-			if (!pass) {
-				other |= skip;
-			} else if (!skip) {
-				memcpy(buf + n, data + start, end - start);
-				n += end - start;
-			}
-			i = end;
-		}
-		if (!other)
-			return 0;
-		if (!pass) {
-			buf = kvmalloc(size, GFP_KERNEL);
-			if (!buf)
-				return -ENOMEM;
-		}
-	}
-	*out = buf;
-	*out_size = n;
-	return 1;
-}
-
-/*
  * The sizes of an Annex-B access unit's NAL units, each from its start code
  * to the next one (the first from the start); past FW_MAX_NALS the rest goes
  * with the last. Returns how many.
@@ -1458,22 +1686,126 @@ static u32 dec_nal_sizes(const u8 *data, u32 size, u32 *sizes)
 	return n;
 }
 
+/* An access unit's Dolby Vision RPU (HEVC NAL unit type 62), if it has one. */
+static const u8 *dec_find_rpu(const u8 *data, size_t size, size_t *len)
+{
+	size_t i, end;
+
+	for (i = 0; i + 4 < size; i++) {
+		if (data[i] || data[i + 1] || data[i + 2] != 1 ||
+		    (data[i + 3] >> 1 & 0x3f) != 62)
+			continue;
+		for (end = i + 3; end + 2 < size; end++)
+			if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
+				break;
+		if (end + 2 >= size)
+			end = size;
+		*len = end - i;
+		return data + i;
+	}
+	return NULL;
+}
+
+static void dec_dovi_free(struct dec_ctx *ctx)
+{
+	kvfree(ctx->dovi_pics);
+	kvfree(ctx->dovi_buf);
+	kfree(ctx->dovi_st);
+	ctx->dovi_pics = NULL;
+	ctx->dovi_buf = NULL;
+	ctx->dovi_st = NULL;
+}
+
+static int dec_dovi_alloc(struct dec_ctx *ctx)
+{
+	unsigned int i;
+
+	ctx->dovi_st = kzalloc(sizeof(*ctx->dovi_st), GFP_KERNEL);
+	ctx->dovi_buf = kvmalloc(DEC_DOVI_RPU_MAX, GFP_KERNEL);
+	ctx->dovi_pics = kvcalloc(DEC_DOVI_RING, sizeof(*ctx->dovi_pics), GFP_KERNEL);
+	if (!ctx->dovi_st || !ctx->dovi_buf || !ctx->dovi_pics) {
+		dec_dovi_free(ctx);
+		return -ENOMEM;
+	}
+	for (i = 0; i < DEC_DOVI_RING; i++)
+		ctx->dovi_pics[i].uid = -1;
+	return 0;
+}
+
+/*
+ * Before the first access unit is fed, the session not yet open: a stream
+ * whose first access unit carries an RPU is Dolby Vision, and its decoder
+ * session is opened as one.
+ */
+static int dec_dovi_detect(struct dec_ctx *ctx, const u8 *data, size_t size)
+{
+	size_t len = 0;
+	const u8 *nal = dec_is_hevc(ctx) ? dec_find_rpu(data, size, &len) : NULL;
+	struct dovi_rpu rpu = {};
+	bool dovi = false;
+	int ret = 0;
+
+	/*
+	 * An RPU makes the stream Dolby Vision, unless it is of a kind the
+	 * display can't compose (enhancement layer...): that plays as its base
+	 * layer. This first RPU need not stand alone (after a seek it may
+	 * refer to a mapping sent before), so other parse results don't count.
+	 */
+	if (nal) {
+		if (!ctx->dovi_st && dec_dovi_alloc(ctx))
+			return 0;
+		memset(ctx->dovi_st, 0, sizeof(*ctx->dovi_st));
+		ret = len > DEC_DOVI_RPU_MAX ? -E2BIG :
+		      dovi_rpu_parse(ctx->dovi_st, nal, len, ctx->dovi_buf, &rpu);
+		dovi = ret != -EOPNOTSUPP;
+		memset(ctx->dovi_st, 0, sizeof(*ctx->dovi_st));
+		dev_info(ctx->dec->dev, "ctx %p: Dolby Vision RPU (profile %u, %d): %s\n",
+			 ctx, rpu.profile, ret,
+			 dovi ? "composed" : "base layer only");
+	}
+	if (!dovi)
+		dec_dovi_free(ctx);
+	ctx->dovi = dovi;
+	return 0;
+}
+
+/* The access unit's composer image, kept by its uid. */
+static void dec_dovi_rpu(struct dec_ctx *ctx, const u8 *data, size_t size, u64 uid)
+{
+	struct dec_dovi_pic *p = &ctx->dovi_pics[uid % DEC_DOVI_RING];
+	struct dovi_rpu rpu;
+	const u8 *nal;
+	size_t len;
+	int ret;
+
+	WRITE_ONCE(p->uid, -1);
+	nal = dec_find_rpu(data, size, &len);
+	if (!nal)
+		return;
+	ret = len > DEC_DOVI_RPU_MAX ? -E2BIG :
+	      dovi_rpu_parse(ctx->dovi_st, nal, len, ctx->dovi_buf, &rpu);
+	if (ret) {
+		dev_warn_ratelimited(ctx->dec->dev, "ctx %p: RPU %llu: %d\n",
+				     ctx, uid, ret);
+		return;
+	}
+	dovi_composer_regs(&rpu, ctx->visible.width, ctx->visible.height,
+			   p->pic.comp);
+	p->pic.dm_valid = rpu.dm;
+	if (rpu.dm)
+		p->pic.dm = *rpu.dm;
+	p->profile = rpu.profile;
+	smp_wmb();
+	WRITE_ONCE(p->uid, uid);
+}
+
 static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 {
 	const void *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0);
 	struct fw_es_data es;
-	u8 *copy = NULL;
 	int ret;
 
-	/* the decoder decodes the base layer, and garbles it if handed more */
-	if (dec_is_hevc(ctx)) {
-		ret = dec_hevc_base_layer(data, size, &copy, &size);
-		if (ret < 0)
-			return ret;
-		if (copy)
-			data = copy;
-	}
 	es = (struct fw_es_data){ .size = size };
 
 	dev_dbg(ctx->dec->dev, "ctx %p: feed %u bytes, starts %*ph\n",
@@ -1484,10 +1816,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 		     es.buf2_offset + es.buf2_size > ctx->cpb_size ||
 		     es.buf1_size + es.buf2_size < size))
 		ret = -EIO;
-	if (ret) {
-		kvfree(copy);
+	if (ret)
 		return ret;
-	}
 	memcpy(ctx->cpb + es.buf1_offset, data, min(size, es.buf1_size));
 	if (size > es.buf1_size)
 		memcpy(ctx->cpb + es.buf2_offset, data + es.buf1_size,
@@ -1497,6 +1827,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	es.uid = ctx->uid++;
 	es.timestamp = es.uid ? es.uid : DEC_TS_FIRST;
 	ctx->ts[es.uid % DEC_TS_RING] = src->vb2_buf.timestamp;
+	if (ctx->dovi)
+		dec_dovi_rpu(ctx, data, size, es.uid);
 	es.size = size;
 	es.au_type = FW_AU_DATA;
 	/* a running frame number: the firmware counts what it holds with it */
@@ -1506,10 +1838,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 		 * a picture's slices in one piece, it decodes the first */
 		struct fw_es_nal_list *nl = kzalloc(sizeof(*nl), GFP_KERNEL);
 
-		if (!nl) {
-			kvfree(copy);
+		if (!nl)
 			return -ENOMEM;
-		}
 		nl->timestamp = es.timestamp;
 		nl->uid = es.uid;
 		nl->size = es.size;
@@ -1522,10 +1852,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 		nl->nal_count = dec_nal_sizes(data, size, nl->nal_size);
 		ret = dec_fw_ioctl(ctx, FW_PUT_ES_BUFFER_NAL_LIST, 0, nl);
 		kfree(nl);
-		kvfree(copy);
 		return ret;
 	}
-	kvfree(copy);
 	return dec_fw_ioctl(ctx, FW_PUT_ES_BUFFER, 0, &es);
 }
 
@@ -1536,7 +1864,7 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
  */
 static bool dec_wait_geometry(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 {
-	struct h264_geometry g;
+	struct h264_geometry g = {};
 
 	if (ctx->src_change)
 		return true;
@@ -1558,6 +1886,7 @@ static bool dec_wait_geometry(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 				   DEC_FW_PICS_MIN_UHD : DEC_FW_PICS_MIN) +
 			       DEC_CAP_SPARE;
 	v4l2_ctrl_s_ctrl(ctx->cap_min_ctrl, ctx->cap_min);
+	dec_set_colour(ctx, &g);
 	dec_signal_geometry(ctx, g.width, g.height, &g.visible);
 	return true;
 }
@@ -1572,13 +1901,21 @@ static void dec_device_run(void *priv)
 
 	mutex_lock(&ctx->fw_lock);
 	src = v4l2_m2m_next_src_buf(m2m_ctx);
-	if (!ctx->handle || !src)
+	if ((!ctx->handle && !ctx->open_pending) || !src)
 		goto out;
 
 	size = vb2_get_plane_payload(&src->vb2_buf, 0);
 	if (size) {
 		if (dec_wait_geometry(ctx, src))
 			goto out;
+		if (ctx->open_pending) {
+			ret = dec_dovi_detect(ctx, vb2_plane_vaddr(&src->vb2_buf, 0), size);
+			if (!ret)
+				ret = dec_session_open(ctx);
+			if (ret)
+				goto consumed;
+			ctx->open_pending = false;
+		}
 		/*
 		 * A short input queue in the firmware, as stock keeps. A new
 		 * session decodes only I pictures until one is back, and its
@@ -1601,6 +1938,7 @@ static void dec_device_run(void *priv)
 		ret = 0;
 	}
 
+consumed:
 	/* The data is in the CPB now: the buffer is consumed. */
 	src = v4l2_m2m_src_buf_remove(m2m_ctx);
 	src->sequence = ctx->out_seq++;
@@ -1620,8 +1958,8 @@ static int dec_job_ready(void *priv)
 {
 	struct dec_ctx *ctx = priv;
 
-	return READ_ONCE(ctx->handle) && !READ_ONCE(ctx->cpb_full) &&
-	       !READ_ONCE(ctx->src_change);
+	return (READ_ONCE(ctx->handle) || READ_ONCE(ctx->open_pending)) &&
+	       !READ_ONCE(ctx->cpb_full) && !READ_ONCE(ctx->src_change);
 }
 
 static const struct v4l2_m2m_ops dec_m2m_ops = {
@@ -1807,7 +2145,12 @@ static int dec_start_streaming(struct vb2_queue *vq, unsigned int count)
 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
 		ctx->uid = 0;
 		ctx->out_seq = 0;
-		ret = dec_session_open(ctx);
+		if (ctx->dovi_st)	/* a new stream position: no earlier RPU state */
+			memset(ctx->dovi_st, 0, sizeof(*ctx->dovi_st));
+		/* HEVC: opened with its first access unit (Dolby Vision or not) */
+		ctx->open_pending = dec_is_hevc(ctx);
+		if (!ctx->open_pending)
+			ret = dec_session_open(ctx);
 	} else {
 		/* CAPTURE (re)configured: for the current geometry? */
 		ctx->cap_seq = 0;
@@ -1832,6 +2175,7 @@ static void dec_stop_streaming(struct vb2_queue *vq)
 		cancel_delayed_work_sync(&ctx->retry_work);
 		cancel_work_sync(&ctx->noti_work);
 		mutex_lock(&ctx->fw_lock);
+		ctx->open_pending = false;
 		dec_session_close(ctx);
 		mutex_unlock(&ctx->fw_lock);
 		v4l2_m2m_clear_state(ctx->fh.m2m_ctx);
@@ -2187,6 +2531,7 @@ static int dec_release(struct file *file)
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	v4l2_ctrl_handler_free(&ctx->ctrls);
+	dec_dovi_free(ctx);
 	kvfree(ctx);
 	return 0;
 }

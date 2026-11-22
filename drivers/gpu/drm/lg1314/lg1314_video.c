@@ -272,6 +272,18 @@ static int video_atomic_check(struct drm_plane *plane,
 	return 0;
 }
 
+/* Close the output (and its Dolby Vision mode). */
+static void video_vo_close(struct lg1314_drm *lg, struct lg1314_video *v)
+{
+	/* Output closed first: no callback can unblank the window after this. */
+	cancel_delayed_work_sync(&v->calib_work);
+	lg1314_vdec_vo_close(v->vo);
+	v->vo = NULL;
+	if (v->dovi_profile)
+		lg1314_dovi_stop(lg);
+	v->dovi_profile = 0;
+}
+
 static void video_atomic_update(struct drm_plane *plane,
 				struct drm_atomic_state *state)
 {
@@ -283,20 +295,52 @@ static void video_atomic_update(struct drm_plane *plane,
 	struct lg1314_vdec_vo_frame f;
 	struct drm_crtc_state *cs;
 	struct lg1314_de_rect in, out;
-	int ret;
+	u64 ts = 0;
+	u32 session = 0;
+	int ret, dovi = -ENOENT;
 
 	if (!fb || !ps->crtc || !ps->visible || !v->vdec)
 		return;
 	cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
 	mode = &cs->mode;
 
+	/* A Dolby Vision stream's picture: its timestamp and composer image. */
+	if (fb->modifier == LG1314_FORMAT_MOD_NV12_8X4)
+		dovi = lg1314_vdec_picture_dovi(v->vdec, video_plane_addr(fb, 0), &ts,
+						&session, &v->dovi_pic);
+
+	/* A stream of the other kind on the same plane (a new title without the
+	 * plane going off; a picture that isn't the decoder's), or a new Dolby
+	 * Vision stream: the output's mode is set at open, and its pictures go
+	 * with it. */
+	if (v->vo && (!!v->dovi_profile != (dovi > 0 || dovi == -ENODATA) ||
+		      (v->dovi_profile && session != v->dovi_session))) {
+		video_vo_close(lg, v);
+		/* the closed output reports no more releases */
+		video_release_all(v);
+	}
+
+	/* A Dolby Vision stream starts with a picture that has a record (one
+	 * after a seek may refer to metadata from before it): until then
+	 * nothing is shown. */
+	if (!v->vo && dovi == -ENODATA)
+		return;
+
 	if (!v->vo) {
+		/* the output's mode is set before its first picture */
+		v->dovi_profile = dovi > 0 && !lg1314_dovi_start(lg) ? dovi : 0;
+		v->dovi_last_addr = 0;
+		v->dovi_pic_valid = false;
+		v->dovi_session = session;
 		v->vo = lg1314_vdec_vo_open(v->vdec, VIDEO_DE_CH, v->rate_mhz, 1000,
-					    &video_vo_ops, v);
+					    v->dovi_profile, &video_vo_ops, v);
 		if (IS_ERR(v->vo)) {
 			drm_err(plane->dev, "video output open failed: %ld\n",
 				PTR_ERR(v->vo));
 			v->vo = NULL;
+			if (v->dovi_profile)
+				lg1314_dovi_stop(lg);
+			v->dovi_profile = 0;
 			return;
 		}
 		video_de_blank(lg, true);
@@ -337,7 +381,25 @@ static void video_atomic_update(struct drm_plane *plane,
 		.crop_right = fb->width - (ps->src.x2 >> 16),
 		.crop_bottom = fb->height - (ps->src.y2 >> 16),
 		.tiled = fb->modifier == LG1314_FORMAT_MOD_NV12_8X4,
+		.pts_ns = -1,
 	};
+	/* Dolby Vision: the picture carries its PTS, its record is ready
+	 * before the display engine asks for it. A picture is written once:
+	 * the output shows it until the next one (a repeat would repeat its
+	 * PTS). */
+	if (v->dovi_profile && dovi != -ENOENT) {
+		if (f.addr_y == v->dovi_last_addr && ts == v->dovi_last_ts)
+			return;
+		v->dovi_last_addr = f.addr_y;
+		v->dovi_last_ts = ts;
+		f.pts_ns = ts;
+		/* every picture written has a record: one without its own
+		 * (its RPU unusable) gets the previous picture's metadata */
+		if (dovi > 0)
+			v->dovi_pic_valid = true;
+		if (v->dovi_pic_valid)
+			lg1314_dovi_queue(lg, lg1314_dovi_pts90(ts), &v->dovi_pic);
+	}
 	if (video_hold(v, fb, f.id)) {
 		drm_err(plane->dev, "video: too many frames in flight\n");
 		return;
@@ -364,10 +426,7 @@ static void video_atomic_disable(struct drm_plane *plane,
 
 	if (!v->vo)
 		return;
-	/* Output closed first: no callback can unblank the window after this. */
-	cancel_delayed_work_sync(&v->calib_work);
-	lg1314_vdec_vo_close(v->vo);
-	v->vo = NULL;
+	video_vo_close(lg, v);
 	lg1314_vsync_video_phase(lg, false);
 	video_de_blank(lg, true);
 	WRITE_ONCE(v->blanked, true);

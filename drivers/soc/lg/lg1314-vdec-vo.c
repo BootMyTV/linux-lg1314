@@ -57,6 +57,7 @@ struct fw_vo_info {
 #define VO_SET_OUTPUT_PORT		_IOW('v', 26, struct fw_vo_port)
 #define VO_WRITE_PICTURE		_IOW('v', 28, struct fw_vo_write)
 #define VO_GET_INFO			_IOR('v', 29, struct fw_vo_info)
+#define VO_ADD_FLAGS			_IO('v', 40)
 
 #define VO_SUBSAMPLE_420		0x00020002
 #define VO_RATE(num, den)		((num) << 16 | (den))
@@ -81,9 +82,20 @@ struct lg1314_vdec_vo {
 
 	struct mutex			lock;	/* serialises calls */
 	struct fw_vo_fb_info		fb;	/* geometry last set */
+
+	u32				*extra;	/* per-picture extra block, or NULL */
+	u32				extra_phys;
 };
 
 static LIST_HEAD(vo_list);
+
+/* Per-picture extra block: {u32 type, u32 size, data padded to 4} entries. */
+#define VO_EXT_END		0x0
+#define VO_EXT_DOVI_PROFILEID	0x4
+#define VO_EXT_DOVI_MEL		0x6
+#define VO_EXT_ADDITIONAL_FRAME	0x20
+#define VO_FLAG_DOLBY		BIT(1)	/* the output's Dolby Vision display mode */
+#define VO_EXTRA_SIZE		SZ_4K
 static DEFINE_SPINLOCK(vo_list_lock);
 
 static int vo_ioctl(struct lg1314_vdec_vo *vo, unsigned int cmd, u32 arg,
@@ -162,6 +174,7 @@ struct lg1314_vdec_vo *lg1314_vdec_vo_open(struct lg1314_vdec *v,
 					   unsigned int de_id,
 					   unsigned int rate_num,
 					   unsigned int rate_den,
+					   unsigned int dovi_profile,
 					   const struct lg1314_vdec_vo_ops *ops,
 					   void *ctx)
 {
@@ -207,6 +220,40 @@ struct lg1314_vdec_vo *lg1314_vdec_vo_open(struct lg1314_vdec *v,
 		ret = vo_ioctl(vo, VO_SET_FREERUN, 1, NULL);
 	if (!ret)
 		ret = vo_ioctl(vo, VO_SET_OUTPUT_PORT, 0, &port);
+	/* Dolby Vision: the display mode before the first picture, and every
+	 * picture's extra block (the profile, no enhancement layer). */
+	if (!ret && dovi_profile)
+		ret = vo_ioctl(vo, VO_ADD_FLAGS, VO_FLAG_DOLBY, NULL);
+	if (!ret && dovi_profile) {
+		u32 *e = lg1314_vdec_mem_alloc(v, VO_EXTRA_SIZE, &vo->extra_phys);
+
+		if (!e) {
+			ret = -ENOMEM;
+		} else {
+			e[0] = VO_EXT_DOVI_PROFILEID;
+			e[1] = 4;
+			e[2] = dovi_profile;
+			e[3] = VO_EXT_DOVI_MEL;
+			e[4] = 4;
+			e[5] = 0;
+			/* the enhancement-layer frame: none (as stock sends it for a
+			 * single-layer stream) */
+			e[6] = VO_EXT_ADDITIONAL_FRAME;
+			e[7] = 0x24;
+			e[8] = 0;
+			e[9] = 1920 << 16 | 1080;
+			e[10] = 0;
+			e[11] = 0;
+			e[12] = 0xffffffff;
+			e[13] = 0xffffffff;
+			e[14] = 0xf00;
+			e[15] = 1;
+			e[16] = 1;
+			e[17] = VO_EXT_END;
+			e[18] = 0;
+			vo->extra = e;
+		}
+	}
 	if (ret) {
 		lg1314_vdec_vo_close(vo);
 		return ERR_PTR(ret);
@@ -227,13 +274,14 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 	};
 	struct fw_vo_write w = {
 		.priv = f->id,
-		.pts = -1,
+		.pts = f->pts_ns,
 		.crop_left = f->crop_left, .crop_right = f->crop_right,
 		.crop_top = f->crop_top, .crop_bottom = f->crop_bottom,
 		.display_period = 1,
 		.multi_picture_index = -1,
 		.addr_y = f->addr_y,
 		.addr_cb = f->addr_c,
+		.extra = vo->extra ? vo->extra_phys : 0,
 	};
 	u32 c;
 	int ret = 0;
@@ -298,6 +346,9 @@ void lg1314_vdec_vo_close(struct lg1314_vdec_vo *vo)
 	vo_ioctl(vo, VO_SET_OUTPUT_PORT, 0, &port);
 	lg1314_vdec_call(vo->v, VDEC_CALL_VO_CLOSE, vo->handle, NULL, 0, 0,
 			 &result);
+	if (vo->extra)
+		lg1314_vdec_mem_free(vo->v, vo->extra, vo->extra_phys, VO_EXTRA_SIZE);
 	kfree(vo);
 }
 EXPORT_SYMBOL_GPL(lg1314_vdec_vo_close);
+

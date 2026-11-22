@@ -7,6 +7,7 @@
 #ifndef _LG1314_DRM_H_
 #define _LG1314_DRM_H_
 
+#include <linux/soc/lg/lg1314-vdec-vo.h>
 #include <linux/bits.h>
 #include <linux/types.h>
 #include <linux/io.h>
@@ -23,6 +24,7 @@ struct drm_framebuffer;
 struct drm_pending_vblank_event;
 struct lg1314_vdec;
 struct lg1314_vdec_vo;
+struct lg1314_hdr_fw;
 
 /* MMIO regions (the bring-up tables use absolute phys addresses). */
 enum lg1314_region {
@@ -33,6 +35,8 @@ enum lg1314_region {
 	LG1314_REG_DPE,		/* 0xc9020000 : DPE path enable              */
 	LG1314_REG_PLL,		/* 0xc9c10000 : DISP PLL                      */
 	LG1314_REG_IMX,		/* 0xc9014000 : DE input mux / sync pulses    */
+	LG1314_REG_PE_HDR,	/* 0xc9005800 : PE HDR block, window 0        */
+	LG1314_REG_PE_ND,	/* 0xc9003000 : PE noise reduction, windows 0/1 */
 	LG1314_REG_COUNT
 };
 
@@ -230,6 +234,15 @@ struct lg1314_video {
 	struct delayed_work		calib_work;
 	unsigned int			calib_passes;
 
+	/* Dolby Vision: the stream's profile while the output runs one (0:
+	 * none), and the picture's composer image */
+	unsigned int			dovi_profile;
+	bool				dovi_pic_valid;	/* dovi_pic is a picture's */
+	u32				dovi_session;	/* decoder session it runs */
+	u32				dovi_last_addr;	/* the picture last written */
+	u64				dovi_last_ts;
+	struct lg1314_dovi_pic		dovi_pic;
+
 	/* display-engine window state */
 	bool				src_set;
 	bool				blanked;
@@ -281,6 +294,25 @@ struct lg1314_drm {
 	/* DE firmware command mailbox */
 	struct mutex			de_lock;
 
+	/* HDR10 (lg1314_hdr.c) */
+	struct {
+		const struct lg1314_hdr_fw *fw;	/* NULL: no HDR10 */
+		void __iomem		*area;	/* table area for the DE firmware */
+		u32			nits;	/* peak the tone map is for */
+		bool			hdr10;
+		bool			applied;
+		u32			blob_id;
+	} hdr;
+
+	/* Dolby Vision (lg1314_dovi.c) */
+	struct {
+		void __iomem		*ring;	/* records for the DE firmware */
+		const struct firmware	*fw;
+		unsigned int		next;	/* slot for the next record */
+		unsigned int		misses;	/* requests without a record */
+		bool			active;
+	} dovi;
+
 	/* channel-power register value preserved from lxboot at probe */
 	u32				chpower_save;
 	bool				enabled;
@@ -314,5 +346,17 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
+struct drm_atomic_state;
+void lg1314_hdr_init(struct lg1314_drm *lg);
+int  lg1314_hdr_init_props(struct lg1314_drm *lg);
+void lg1314_hdr_edid(struct drm_connector *connector);
+void lg1314_hdr_commit(struct lg1314_drm *lg, struct drm_atomic_state *state);
+int  lg1314_dovi_init(struct lg1314_drm *lg, int irq);
+void lg1314_dovi_fini(struct lg1314_drm *lg);
+int  lg1314_dovi_start(struct lg1314_drm *lg);
+void lg1314_dovi_stop(struct lg1314_drm *lg);
+u32  lg1314_dovi_pts90(u64 ns);
+void lg1314_dovi_queue(struct lg1314_drm *lg, u32 pts90,
+		       const struct lg1314_dovi_pic *pic);
 
 #endif /* _LG1314_DRM_H_ */

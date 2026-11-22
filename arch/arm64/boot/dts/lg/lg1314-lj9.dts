@@ -150,9 +150,10 @@
 		lge,de-model = <0x00020001>;
 		lge,micom = <&micom>;
 		lge,vdec = <&vdec>;
-		/* OSD mixer vsync, DE sync pulses (video tick) */
+		/* OSD mixer vsync, DE sync pulses (video tick), DE IPC */
 		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
-			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>;
+			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	vdec: vdec {

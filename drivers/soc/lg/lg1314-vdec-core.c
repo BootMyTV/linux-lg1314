@@ -579,6 +579,32 @@ const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 	return p;
 }
 
+/*
+ * A small host-filled buffer the firmware reads (from the vdec pool), with a
+ * write-combined kernel mapping. Returns NULL on failure.
+ */
+void *lg1314_vdec_mem_alloc(struct lg1314_vdec *v, size_t size, u32 *phys)
+{
+	unsigned long p = gen_pool_alloc(v->hma_vdec, size);
+	void *va;
+
+	if (!p)
+		return NULL;
+	va = memremap(p, size, MEMREMAP_WC);
+	if (!va) {
+		gen_pool_free(v->hma_vdec, p, size);
+		return NULL;
+	}
+	*phys = p;
+	return va;
+}
+
+void lg1314_vdec_mem_free(struct lg1314_vdec *v, void *va, u32 phys, size_t size)
+{
+	memunmap(va);
+	gen_pool_free(v->hma_vdec, phys, size);
+}
+
 /* ---- firmware buffer allocator (firmware->host hma calls) ---- */
 
 /* Pool by the firmware's name for it. */
@@ -656,6 +682,13 @@ u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c)
 	return lg1314_vdec_dec_picture_priv(v->dec, addr, addr_c);
 }
 
+int lg1314_vdec_picture_dovi(struct lg1314_vdec *v, u32 addr, u64 *timestamp,
+			     u32 *session, struct lg1314_dovi_pic *pic)
+{
+	return lg1314_vdec_dec_picture_dovi(v->dec, addr, timestamp, session, pic);
+}
+EXPORT_SYMBOL_GPL(lg1314_vdec_picture_dovi);
+
 static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 			  u32 size, u32 align, const char *name)
 {
@@ -693,8 +726,9 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 		}
 	}
 	if (!phys) {
-		dev_warn_ratelimited(v->dev, "hma: out of memory for %u bytes (align %#x)\n",
-				     size, align);
+		dev_warn_ratelimited(v->dev, "hma: out of memory for %u bytes (align %#x) in %s for \"%s\"\n",
+				     size, align, pool ? (pool == v->hma_cpb ? "cpb" : "vdec") : "dpb",
+				     name);
 		kfree(a);
 		if (!pool && !strcmp(name, "gx_dpb"))
 			lg1314_vdec_dec_dpb_failed(v->dec);
