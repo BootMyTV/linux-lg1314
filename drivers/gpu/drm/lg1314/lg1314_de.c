@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /* LG1314 display-engine PQE firmware download. */
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/sizes.h>
+#include <linux/uaccess.h>
 #include "lg1314_drm.h"
 
 /*
@@ -132,3 +135,274 @@ out:
 	release_firmware(fw);
 	return ret;
 }
+
+/*
+ * Firmware command mailbox. A message is a u32 command followed by its
+ * parameter struct, sent in chunks of up to 124 bytes. Each chunk has a
+ * header word {size, chunks remaining, from host, value}; the firmware
+ * clears the size byte once it has taken the chunk. Replies arrive the same
+ * way in the receive mailbox, which the host frees by clearing its size byte.
+ */
+#define DE_MBOX_FROM_HOST	2
+#define DE_MBOX_TYPE_VAL	2
+#define DE_MBOX_HDR(len, cont)	((len) | (cont) << 8 | DE_MBOX_FROM_HOST << 16 | \
+				 DE_MBOX_TYPE_VAL << 24)
+#define DE_MBOX_PAYLOAD		(DE_IPC_MBOX_SIZE - 4)
+#define DE_MBOX_MSG_MAX		256
+#define DE_MBOX_TIMEOUT_US	200000
+
+#define DE_MBOX_KICK_US		20000
+
+static int de_mbox_wait(struct lg1314_drm *lg, u32 off, bool full)
+{
+	void __iomem *mbox = lg->mmio[LG1314_REG_DE_IPC].virt + off;
+	u32 v;
+
+	return readl_poll_timeout(mbox, v, !!(v & 0xff) == full, 100,
+				  DE_MBOX_TIMEOUT_US);
+}
+
+/*
+ * Wait for the firmware to take the chunk in the transmit mailbox. A
+ * doorbell rung before the firmware listens is lost, so ring it again while
+ * waiting.
+ */
+static int de_mbox_wait_taken(struct lg1314_drm *lg)
+{
+	void __iomem *ipc = lg->mmio[LG1314_REG_DE_IPC].virt;
+	int waited;
+	u32 v;
+
+	for (waited = 0; waited < DE_MBOX_TIMEOUT_US; waited += DE_MBOX_KICK_US) {
+		if (!readl_poll_timeout(ipc + DE_IPC_MBOX_TX, v, !(v & 0xff), 100,
+					DE_MBOX_KICK_US))
+			return 0;
+		writel(DE_IPC_MBOX_IRQ, ipc + DE_IPC_INT_EVENT);
+	}
+	return -ETIMEDOUT;
+}
+
+static void de_ack_irqs(struct lg1314_drm *lg)
+{
+	void __iomem *ipc = lg->mmio[LG1314_REG_DE_IPC].virt;
+	u32 st = readl(ipc + DE_IPC_EXT_STATUS);
+
+	if (st)
+		writel(st, ipc + DE_IPC_EXT_CLEAR);
+}
+
+static int de_send(struct lg1314_drm *lg, u32 cmd, const void *data, size_t len)
+{
+	void __iomem *tx = lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_MBOX_TX;
+	u8 msg[DE_MBOX_MSG_MAX] __aligned(4);
+	size_t total = sizeof(cmd) + len, off, n, i;
+	unsigned int cont;
+	int ret = 0;
+
+	lockdep_assert_held(&lg->de_lock);
+
+	if (total > sizeof(msg))
+		return -EINVAL;
+	memcpy(msg, &cmd, sizeof(cmd));
+	if (len)
+		memcpy(msg + sizeof(cmd), data, len);
+
+	cont = total / DE_MBOX_PAYLOAD;
+	for (off = 0; off < total; off += n, cont--) {
+		n = min_t(size_t, total - off, DE_MBOX_PAYLOAD);
+
+		ret = de_mbox_wait_taken(lg);
+		if (ret)
+			break;
+		for (i = 0; i < n; i += 4) {
+			u32 w = 0;
+
+			memcpy(&w, msg + off + i, min_t(size_t, 4, n - i));
+			writel(w, tx + 4 + i);
+		}
+		writel(DE_MBOX_HDR(n, cont), tx);
+		writel(DE_IPC_MBOX_IRQ,
+		       lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_INT_EVENT);
+	}
+	if (!ret)
+		ret = de_mbox_wait_taken(lg);
+	de_ack_irqs(lg);
+
+	if (ret)
+		dev_err(lg->dev, "DE command %#x not taken by firmware\n", cmd);
+	return ret;
+}
+
+int lg1314_de_cmd(struct lg1314_drm *lg, u32 cmd, const void *data, size_t len)
+{
+	int ret;
+
+	mutex_lock(&lg->de_lock);
+	ret = de_send(lg, cmd, data, len);
+	mutex_unlock(&lg->de_lock);
+	return ret;
+}
+
+/* Send a parameterless request and read back its reply (single chunk). */
+int lg1314_de_query(struct lg1314_drm *lg, u32 cmd, void *out, size_t len)
+{
+	void __iomem *rx = lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_MBOX_RX;
+	size_t got;
+	int ret;
+
+	mutex_lock(&lg->de_lock);
+	writel(0, rx);
+	ret = de_send(lg, cmd, NULL, 0);
+	if (!ret)
+		ret = de_mbox_wait(lg, DE_IPC_MBOX_RX, true);
+	if (!ret) {
+		size_t i;
+
+		/* The mailbox only takes 32-bit accesses. */
+		got = min_t(size_t, readl(rx) & 0xff, len);
+		for (i = 0; i < got; i += 4) {
+			u32 w = readl(rx + 4 + i);
+
+			memcpy(out + i, &w, min_t(size_t, 4, got - i));
+		}
+		ret = got;
+	} else {
+		dev_err(lg->dev, "DE request %#x: no reply\n", cmd);
+	}
+	writel(0, rx);
+	de_ack_irqs(lg);
+	mutex_unlock(&lg->de_lock);
+	return ret;
+}
+
+/*
+ * A freshly started firmware takes the memory layout table out of the
+ * transmit mailbox once it is up; wait for that before the first command.
+ */
+#define DE_FW_READY_TIMEOUT_US	2000000
+#define DE_CMD_GET_FW_INFO	0x02
+
+int lg1314_de_wait_ready(struct lg1314_drm *lg)
+{
+	void __iomem *tx = lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_MBOX_TX;
+	u32 v;
+	int ret;
+
+	struct {			/* LX_DE_FIRMWARE_INFO_T */
+		u32 version;
+		u16 year, month, day;
+	} __packed info;
+	int tries;
+
+	ret = readl_poll_timeout(tx, v, !(v & 0xff), 1000, DE_FW_READY_TIMEOUT_US);
+	/* Then until it answers a request. */
+	for (tries = 0; !ret && tries < 10; tries++) {
+		ret = lg1314_de_query(lg, DE_CMD_GET_FW_INFO, &info, sizeof(info));
+		if (ret == sizeof(info)) {
+			dev_info(lg->dev, "DE firmware %u (%04u-%02u-%02u) running\n",
+				 info.version, info.year, info.month, info.day);
+			return 0;
+		}
+		ret = 0;
+	}
+	dev_err(lg->dev, "DE firmware did not come up\n");
+	return -ETIMEDOUT;
+}
+
+#define DE_CMD_SET_FR_RATE	0x1c
+#define DE_PANEL_RATE		120
+
+/*
+ * Lock the panel timing to the video source (the decoder output's tick, at
+ * half the panel rate), as the vendor driver does at playback.
+ */
+int lg1314_de_frame_lock(struct lg1314_drm *lg)
+{
+	struct {
+		u32 force_free_run;
+		u16 rate;
+		u16 pad;
+	} fr = { .force_free_run = 0, .rate = DE_PANEL_RATE };
+
+	return lg1314_de_cmd(lg, DE_CMD_SET_FR_RATE, &fr, sizeof(fr));
+}
+
+#ifdef CONFIG_DEBUG_FS
+/*
+ * de_cmd: write "<cmd> [u32 ...]" (hex) to send a command with those
+ * parameter words; "? <cmd>" sends a request and keeps the reply, which a
+ * read returns as hex words.
+ */
+static u32 de_dbg_reply[DE_MBOX_PAYLOAD / 4];
+static int de_dbg_reply_len;
+
+static ssize_t de_cmd_write(struct file *file, const char __user *ubuf,
+			    size_t count, loff_t *ppos)
+{
+	struct lg1314_drm *lg = file->private_data;
+	u32 words[DE_MBOX_MSG_MAX / 4];
+	char buf[512], *p = buf, *tok;
+	bool query = false;
+	int n = 0, ret;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+	buf[count] = '\0';
+
+	while ((tok = strsep(&p, " \t\n"))) {
+		if (!*tok)
+			continue;
+		if (!n && !query && !strcmp(tok, "?")) {
+			query = true;
+			continue;
+		}
+		if (n == ARRAY_SIZE(words))
+			return -E2BIG;
+		ret = kstrtou32(tok, 16, &words[n++]);
+		if (ret)
+			return ret;
+	}
+	if (!n)
+		return -EINVAL;
+
+	if (query) {
+		ret = lg1314_de_query(lg, words[0], de_dbg_reply,
+				      sizeof(de_dbg_reply));
+		de_dbg_reply_len = ret < 0 ? 0 : ret;
+	} else {
+		ret = lg1314_de_cmd(lg, words[0], &words[1], (n - 1) * 4);
+	}
+	return ret < 0 ? ret : count;
+}
+
+static ssize_t de_cmd_read(struct file *file, char __user *ubuf,
+			   size_t count, loff_t *ppos)
+{
+	char buf[DE_MBOX_PAYLOAD / 4 * 9 + 2];
+	int i, len = 0;
+
+	for (i = 0; i < DIV_ROUND_UP(de_dbg_reply_len, 4); i++)
+		len += scnprintf(buf + len, sizeof(buf) - len, "%08x ",
+				 de_dbg_reply[i]);
+	len += scnprintf(buf + len, sizeof(buf) - len, "\n");
+	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+}
+
+static const struct file_operations de_cmd_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = de_cmd_write,
+	.read = de_cmd_read,
+	.llseek = default_llseek,
+};
+
+void lg1314_de_debugfs_init(struct lg1314_drm *lg)
+{
+	debugfs_create_file("de_cmd", 0600, lg->drm.debugfs_root, lg,
+			    &de_cmd_fops);
+}
+#else
+void lg1314_de_debugfs_init(struct lg1314_drm *lg) { }
+#endif

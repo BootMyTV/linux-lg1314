@@ -20,6 +20,7 @@
  */
 
 #include <linux/completion.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/genalloc.h>
@@ -30,14 +31,18 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/dma-mapping.h>
 #include <linux/platform_device.h>
+#include <linux/seq_file.h>
 #include <linux/serial_core.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/tty_flip.h>
 #include <linux/workqueue.h>
+
+#include <linux/soc/lg/lg1314-vdec-vo.h>
 
 #include "lg1314-vdec.h"
 
@@ -119,6 +124,11 @@ static struct lg1314_vdec *vdec_instance;
 #define VDEC_MCU_IPC_SIZE	0x100
 #define IPC_READY_FLAG		0x00	/* build magic, written once the firmware's init is done */
 #define IPC_LOG_SEND_ADDR	0x60	/* firmware writes this during IPC init */
+/* The firmware's log ring (descriptor at +0x60: addr, size, head, tail, in
+ * the argument area). The firmware stalls when it is full, so the host keeps
+ * it drained; the latest part is kept for debugfs. */
+#define IPC_FW_LOG		0x60
+#define VDEC_FW_LOG_KEEP	SZ_64K
 /* Console ring descriptors (host view): tx owned by us, rx owned by firmware. */
 #define IPC_UART_TX_HEAD	0x70
 #define IPC_UART_TX_TAIL	0x74
@@ -182,6 +192,7 @@ enum {
 	VDEC_MSG_IOCTL,
 };
 #define IPC_VDEC_TYPE_POLL_VDEC	0x10000000	/* copro->host: input consumed */
+#define IPC_VDEC_TYPE_POLL_VO	0x10000001	/* copro->host: output readiness */
 #define IPC_VDEC_TYPE_POLL_VO	0x10000001	/* copro->host: frame ready */
 #define IPC_VDEC_TYPE_PONG	0x10000002	/* copro->host: ping reply */
 #define IPC_VDEC_TYPE_SUSPEND	0x10001000	/* host->copro */
@@ -257,7 +268,15 @@ struct lg1314_vdec {
 
 	struct uart_driver	uart_driver;
 	struct uart_port	uart_port;
+
+	spinlock_t		fwlog_lock;	/* the firmware log ring's tail */
+	char			*fwlog;		/* its latest VDEC_FW_LOG_KEEP bytes */
+	size_t			fwlog_len;	/* bytes ever kept */
+	struct delayed_work	fwlog_work;	/* drains it when idle */
+	struct dentry		*fwlog_file;
 	bool			rx_running;
+
+	bool			ready;		/* firmware up, interfaces registered */
 };
 
 /* ---- doorbell ---- */
@@ -459,10 +478,39 @@ struct vdec_hma_alloc {
 	struct list_head	list;
 	struct gen_pool		*pool;	/* NULL: from the dpb CMA area (DMA API) */
 	void			*vaddr;	/* dpb: cached kernel mapping */
+	void			*lent;	/* dpb: a decoder's output buffer instead */
 	u32			phys;
 	u32			size;
 };
 
+
+/*
+ * For the display driver: the decoder behind @np, holding a reference to its
+ * device. Unbinding the decoder while the display uses it is not supported.
+ */
+struct lg1314_vdec *lg1314_vdec_get(struct device_node *np)
+{
+	struct platform_device *pdev = of_find_device_by_node(np);
+	struct lg1314_vdec *v;
+
+	if (!pdev)
+		return ERR_PTR(-EPROBE_DEFER);
+	device_lock(&pdev->dev);
+	v = platform_get_drvdata(pdev);
+	if (!v || !READ_ONCE(v->ready))
+		v = ERR_PTR(-EPROBE_DEFER);
+	device_unlock(&pdev->dev);
+	if (IS_ERR(v))
+		put_device(&pdev->dev);
+	return v;
+}
+EXPORT_SYMBOL_GPL(lg1314_vdec_get);
+
+void lg1314_vdec_put(struct lg1314_vdec *v)
+{
+	put_device(v->dev);
+}
+EXPORT_SYMBOL_GPL(lg1314_vdec_put);
 
 struct device *lg1314_vdec_device(struct lg1314_vdec *v)
 {
@@ -516,7 +564,7 @@ const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 
 	mutex_lock(&v->hma_lock);
 	list_for_each_entry(a, &v->hma_allocs, list) {
-		if (a->pool || phys < a->phys || phys - a->phys >= a->size ||
+		if (a->pool || a->lent || phys < a->phys || phys - a->phys >= a->size ||
 		    len > a->size - (phys - a->phys))
 			continue;
 		dma_sync_single_for_cpu(v->dev, phys, len, DMA_FROM_DEVICE);
@@ -563,6 +611,9 @@ static unsigned long vdec_hma_alloc_dpb(struct lg1314_vdec *v,
 				     DMA_FROM_DEVICE);
 		return 0;
 	}
+	/* The allocator cleared it through the cache: write that back now, or
+	 * evicted lines land on top of what the firmware writes later. */
+	dma_sync_single_for_device(v->dev, dma, max(size, align), DMA_FROM_DEVICE);
 	return dma;
 }
 
@@ -570,6 +621,8 @@ static void vdec_hma_free_one(struct lg1314_vdec *v, struct vdec_hma_alloc *a)
 {
 	if (a->pool)
 		gen_pool_free(a->pool, a->phys, a->size);
+	else if (a->lent)
+		lg1314_vdec_dec_dpb_free(a->lent);
 	else
 		dma_free_noncoherent(v->dev, a->size, a->vaddr, a->phys,
 				     DMA_FROM_DEVICE);
@@ -577,7 +630,7 @@ static void vdec_hma_free_one(struct lg1314_vdec *v, struct vdec_hma_alloc *a)
 }
 
 static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
-			  u32 size, u32 align)
+			  u32 size, u32 align, const char *name)
 {
 	struct genpool_data_align data = { .align = align };
 	struct vdec_hma_alloc *a;
@@ -591,13 +644,23 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 	if (pool) {
 		phys = gen_pool_alloc_algo(pool, size, gen_pool_first_fit_align, &data);
 	} else {
-		phys = vdec_hma_alloc_dpb(v, a, size, align);
-		size = max(size, align);
+		/* A decoded-picture buffer goes straight to userspace when a
+		 * decoder has an output buffer to lend for it. */
+		phys = 0;
+		if (!strcmp(name, "gx_dpb"))
+			phys = lg1314_vdec_dec_dpb_alloc(v->dec, size, align,
+							 &a->lent);
+		if (!phys) {
+			phys = vdec_hma_alloc_dpb(v, a, size, align);
+			size = max(size, align);
+		}
 	}
 	if (!phys) {
 		dev_warn(v->dev, "hma: out of memory for %u bytes (align %#x)\n",
 			 size, align);
 		kfree(a);
+		if (!pool && !strcmp(name, "gx_dpb"))
+			lg1314_vdec_dec_dpb_failed(v->dec);
 		return 0;
 	}
 	a->pool = pool;
@@ -667,7 +730,7 @@ static int vdec_remote_call_run(struct lg1314_vdec *v, u32 call, u32 priv,
 				name = pool_name + strlen(pool_name) + 1;
 		}
 		pool = vdec_hma_pool(v, pool_name);
-		phys = vdec_hma_alloc(v, pool, w[0], w[1]);
+		phys = vdec_hma_alloc(v, pool, w[0], w[1], name);
 		if (vdec_debug)
 			dev_info(v->dev, "hma: alloc %s %u (align %#x) %s = %#x\n",
 				 pool_name, w[0], w[1], name, phys);
@@ -756,6 +819,11 @@ static void vdec_msg_dispatch(struct lg1314_vdec *v, const struct vdec_qarg *arg
 		/* target_number = decoder handle, offs = poll mask */
 		lg1314_vdec_pt_poll(v->pt, arg->target_number, arg->offs);
 		lg1314_vdec_dec_poll(v->dec, arg->target_number, arg->offs);
+		break;
+	case IPC_VDEC_TYPE_POLL_VO:
+		/* target_number = output handle, offs = poll mask */
+		lg1314_vdec_pt_poll(v->pt, arg->target_number, arg->offs);
+		lg1314_vdec_vo_poll(arg->target_number, arg->offs);
 		break;
 	default:
 		dev_info(v->dev,
@@ -1086,6 +1154,66 @@ static void vdec_uart_tx(struct lg1314_vdec *v)
 	}
 }
 
+/* ---- firmware log ---- */
+
+/* Consume the firmware's log ring, keeping the latest part. Any context. */
+static void vdec_fwlog_drain(struct lg1314_vdec *v)
+{
+	u32 off, size, head, tail, n, i;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->fwlog_lock, flags);
+	off = vdec_qfield(v, IPC_FW_LOG, Q_ADDR);
+	size = vdec_qfield(v, IPC_FW_LOG, Q_SIZE);
+	head = vdec_qfield(v, IPC_FW_LOG, Q_HEAD);
+	tail = vdec_qfield(v, IPC_FW_LOG, Q_TAIL);
+	if (!size || off > VDEC_ARG_SIZE || size > VDEC_ARG_SIZE - off ||
+	    head >= size || tail >= size)
+		goto out;
+	while (tail != head) {
+		n = head > tail ? head - tail : size - tail;
+		if (v->fwlog)
+			for (i = 0; i < n; i++)
+				v->fwlog[v->fwlog_len++ % VDEC_FW_LOG_KEEP] =
+					((const char *)v->arg)[off + tail + i];
+		tail = (tail + n) % size;
+	}
+	writel(tail, v->ipc + IPC_FW_LOG + Q_TAIL);
+out:
+	spin_unlock_irqrestore(&v->fwlog_lock, flags);
+}
+
+static void vdec_fwlog_work(struct work_struct *work)
+{
+	struct lg1314_vdec *v = container_of(to_delayed_work(work),
+					     struct lg1314_vdec, fwlog_work);
+
+	vdec_fwlog_drain(v);
+	schedule_delayed_work(&v->fwlog_work, msecs_to_jiffies(500));
+}
+
+static int vdec_fwlog_show(struct seq_file *m, void *unused)
+{
+	struct lg1314_vdec *v = m->private;
+	size_t len, start, i;
+	unsigned long flags;
+	char *copy;
+
+	copy = kvmalloc(VDEC_FW_LOG_KEEP, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	spin_lock_irqsave(&v->fwlog_lock, flags);
+	len = min_t(size_t, v->fwlog_len, VDEC_FW_LOG_KEEP);
+	start = v->fwlog_len - len;
+	for (i = 0; i < len; i++)
+		copy[i] = v->fwlog[(start + i) % VDEC_FW_LOG_KEEP];
+	spin_unlock_irqrestore(&v->fwlog_lock, flags);
+	seq_write(m, copy, len);
+	kvfree(copy);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(vdec_fwlog);
+
 static irqreturn_t vdec_irq(int irq, void *data)
 {
 	struct lg1314_vdec *v = data;
@@ -1093,6 +1221,7 @@ static irqreturn_t vdec_irq(int irq, void *data)
 	writel(INTR_BIT, v->rc + RC_INTR_CLEAR);
 	vdec_msg_rx(v);
 	vdec_uart_rx(v);
+	vdec_fwlog_drain(v);
 	return IRQ_HANDLED;
 }
 
@@ -1349,6 +1478,10 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	spin_lock_init(&v->fwlog_lock);
+	v->fwlog = devm_kzalloc(dev, VDEC_FW_LOG_KEEP, GFP_KERNEL);
+	INIT_DELAYED_WORK(&v->fwlog_work, vdec_fwlog_work);
+
 	v->irq = platform_get_irq(pdev, 0);
 	if (v->irq < 0)
 		return v->irq;
@@ -1364,10 +1497,13 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 	ret = vdec_boot(v);
 	if (ret)
 		return ret;
+	schedule_delayed_work(&v->fwlog_work, 0);
+	v->fwlog_file = debugfs_create_file("lg1314-vdec-fwlog", 0400, NULL, v,
+					    &vdec_fwlog_fops);
 
 	ret = vdec_console_register(v);
 	if (ret)
-		return ret;
+		goto err_fwlog;
 
 	v->pt = lg1314_vdec_pt_init(v);
 	if (IS_ERR(v->pt)) {
@@ -1383,11 +1519,15 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 	}
 
 	vdec_instance = v;	/* enable the sysfs test triggers */
+	WRITE_ONCE(v->ready, true);
 	return 0;
 
 err_console:
 	uart_remove_one_port(&v->uart_driver, &v->uart_port);
 	uart_unregister_driver(&v->uart_driver);
+err_fwlog:
+	debugfs_remove(v->fwlog_file);
+	cancel_delayed_work_sync(&v->fwlog_work);
 	return ret;
 }
 
@@ -1396,6 +1536,7 @@ static void lg1314_vdec_remove(struct platform_device *pdev)
 	struct lg1314_vdec *v = platform_get_drvdata(pdev);
 
 	vdec_instance = NULL;
+	WRITE_ONCE(v->ready, false);
 	lg1314_vdec_dec_exit(v->dec);
 	lg1314_vdec_pt_exit(v->pt);
 	/* Stop taking messages and finish firmware calls in flight, then return
@@ -1407,6 +1548,8 @@ static void lg1314_vdec_remove(struct platform_device *pdev)
 
 	uart_remove_one_port(&v->uart_driver, &v->uart_port);
 	uart_unregister_driver(&v->uart_driver);
+	debugfs_remove(v->fwlog_file);
+	cancel_delayed_work_sync(&v->fwlog_work);
 }
 
 static const struct of_device_id lg1314_vdec_of_match[] = {
@@ -1427,3 +1570,4 @@ module_platform_driver(lg1314_vdec_driver);
 
 MODULE_DESCRIPTION("LG1314 video-decode coprocessor");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");

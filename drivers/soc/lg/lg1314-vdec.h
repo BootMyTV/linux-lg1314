@@ -38,12 +38,26 @@ bool lg1314_vdec_in_carveout(struct lg1314_vdec *v, phys_addr_t phys, size_t siz
 const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 				  size_t len);
 
+/* Video output (lg1314-vdec-vo.c): an output's readiness changed. IRQ context. */
+void lg1314_vdec_vo_poll(u32 handle, u32 mask);
+
 /* V4L2 stateful decoder (lg1314-vdec-v4l2.c). */
 struct lg1314_vdec_dec;
 struct lg1314_vdec_dec *lg1314_vdec_dec_init(struct lg1314_vdec *v);
 void lg1314_vdec_dec_exit(struct lg1314_vdec_dec *dec);
 /* A decoder's readiness changed (POLLIN etc.). IRQ context. */
 void lg1314_vdec_dec_poll(struct lg1314_vdec_dec *dec, u32 handle, u32 mask);
+/*
+ * The firmware wants a decoded-picture buffer of @size bytes: lend it a
+ * decoder's output buffer if one fits. Returns its physical address and sets
+ * *@cookie, or returns 0. Process context.
+ */
+u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
+			      void **cookie);
+/* The firmware is done with a lent buffer. */
+void lg1314_vdec_dec_dpb_free(void *cookie);
+/* A decoded-picture buffer couldn't be had at all: the decoders stop. */
+void lg1314_vdec_dec_dpb_failed(struct lg1314_vdec_dec *dec);
 
 #if IS_ENABLED(CONFIG_LG1314_VDEC_PASSTHROUGH)
 struct lg1314_vdec_pt *lg1314_vdec_pt_init(struct lg1314_vdec *v);

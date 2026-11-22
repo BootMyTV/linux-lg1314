@@ -145,6 +145,10 @@
 		/* Model word for the DE firmware (from the board's hwopt). */
 		lge,de-model = <0x00020001>;
 		lge,micom = <&micom>;
+		lge,vdec = <&vdec>;
+		/* OSD mixer vsync, DE sync pulses (video tick) */
+		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
 	vdec: vdec {

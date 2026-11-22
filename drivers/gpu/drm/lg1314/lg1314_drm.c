@@ -12,7 +12,9 @@
 #include <linux/platform_device.h>
 
 #include <drm/clients/drm_client_setup.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_blend.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fbdev_dma.h>
@@ -23,6 +25,9 @@
 #include <drm/drm_managed.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
+#include <drm/drm_vblank.h>
+#include <linux/bitfield.h>
+#include <linux/interrupt.h>
 
 #include "lg1314_drm.h"
 
@@ -36,6 +41,7 @@ static const struct {
 	[LG1314_REG_DE_IPC] = { 0xc9026000, 0x1000 },
 	[LG1314_REG_DPE]    = { 0xc9020000, 0x1000 },
 	[LG1314_REG_PLL]    = { 0xc9c10000, 0x1000 },
+	[LG1314_REG_IMX]    = { IMX_PHYS, 0x100 },
 };
 
 void __iomem *lg1314_map(struct lg1314_drm *lg, u32 phys)
@@ -67,19 +73,162 @@ u32 lg1314_rd(struct lg1314_drm *lg, u32 phys)
 	return p ? readl(p) : 0;
 }
 
-/* ---------------------------------------------------------------- KMS pipe -- */
+/* -------------------------------------------------------------- KMS core -- */
+
+/*
+ * One CRTC: the OSD (primary plane) and the video plane, mixed by the display
+ * engine. Vblank is every other OSD mixer vsync: the panel refreshes at twice
+ * the mode's rate, locked to the video output's tick (lg1314_de_frame_lock).
+ */
 
 static const u32 lg1314_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
 };
 
-static void lg1314_pipe_enable(struct drm_simple_display_pipe *pipe,
-			       struct drm_crtc_state *crtc_state,
-			       struct drm_plane_state *plane_state)
+static void lg1314_osd_show(struct lg1314_drm *lg, struct drm_plane_state *ps)
 {
-	struct lg1314_drm *lg = to_lg1314(pipe->crtc.dev);
-	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_framebuffer *fb = ps->fb;
+
+	lg1314_osd_flip(lg, drm_fb_dma_get_gem_addr(fb, ps, 0), fb->pitches[0],
+			fb->width, fb->height, !fb->format->has_alpha);
+}
+
+/* ---- primary plane (OSD) ---- */
+
+/* The OSD takes 1280x720 to 3840x2160, full screen; the device minimum is
+ * lower, for video frames on the video plane. */
+static int lg1314_primary_atomic_check(struct drm_plane *plane,
+				       struct drm_atomic_state *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_framebuffer *fb = ps->fb;
+	struct drm_crtc_state *cs;
+
+	if (!fb || !ps->crtc)
+		return 0;
+	if (fb->width < LG1314_FB_MIN_W || fb->height < LG1314_FB_MIN_H)
+		return -EINVAL;
+
+	cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	return drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
+						   DRM_PLANE_NO_SCALING,
+						   false, false);
+}
+
+static void lg1314_primary_atomic_update(struct drm_plane *plane,
+					 struct drm_atomic_state *state)
+{
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, plane);
+	struct lg1314_drm *lg = to_lg1314(plane->dev);
+
+	if (!lg->enabled)
+		return;
+	/* No framebuffer: the display stays on, showing only the video plane. */
+	if (ps->fb)
+		lg1314_osd_show(lg, ps);
+	lg1314_osd_layer(lg, ps->fb);
+}
+
+static const struct drm_plane_helper_funcs lg1314_primary_helper_funcs = {
+	.atomic_check = lg1314_primary_atomic_check,
+	.atomic_update = lg1314_primary_atomic_update,
+};
+
+static const struct drm_plane_funcs lg1314_primary_funcs = {
+	.update_plane = drm_atomic_helper_update_plane,
+	.disable_plane = drm_atomic_helper_disable_plane,
+	.destroy = drm_plane_cleanup,
+	.reset = drm_atomic_helper_plane_reset,
+	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+};
+
+/* ---- CRTC ---- */
+
+/*
+ * Vblank: every other panel refresh (OSD mixer vsync); while video is shown,
+ * the video output's tick instead (DE sync pulse i5 following the video
+ * source), which is when a new video frame is latched. The panel runs close
+ * to, but not phase-locked with, twice that tick.
+ */
+static irqreturn_t lg1314_vsync_irq(int irq, void *arg)
+{
+	struct lg1314_drm *lg = arg;
+	bool vblank;
+
+	if (!lg1314_osd_vsync_ack(lg))
+		return IRQ_NONE;
+
+	vblank = !READ_ONCE(lg->video_phase) && (++lg->vsync_count & 1);
+	if (vblank)
+		drm_crtc_handle_vblank(&lg->crtc);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t lg1314_video_tick_irq(int irq, void *arg)
+{
+	struct lg1314_drm *lg = arg;
+
+	if (!(lg1314_rd(lg, DE_IPC_PHYS + DE_IPC_CPU_FLAG) & DE_IPC_CPU_FLAG_IMX) ||
+	    !(lg1314_rd(lg, IMX_PHYS + IMX_INTR_REG) & IMX_PULSE_I5))
+		return IRQ_NONE;
+	lg1314_wr(lg, IMX_PHYS + IMX_INTR_REG, IMX_PULSE_I5);
+
+	if (READ_ONCE(lg->video_phase)) {
+		u64 now = ktime_get_ns();
+
+		if (!lg->tick_n++)
+			lg->tick_first_ns = now;
+		lg->tick_last_ns = now;
+		drm_crtc_handle_vblank(&lg->crtc);
+	}
+	return IRQ_HANDLED;
+}
+
+void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on)
+{
+	u32 pulse = lg1314_rd(lg, IMX_PHYS + IMX_CTRL_INTR_PULSE);
+	u32 mask = lg1314_rd(lg, IMX_PHYS + IMX_INTR_MASK);
+	u32 mux = lg1314_rd(lg, IMX_PHYS + IMX_INTR_MUX);
+
+	u32 en = lg1314_rd(lg, DE_IPC_PHYS + DE_IPC_CPU_FLAG_EN);
+
+	if (on) {
+		pulse = (pulse & ~IMX_PULSE_I5_CFG) |
+			FIELD_PREP(IMX_PULSE_I5_CFG, IMX_PULSE_SRC0);
+		lg1314_wr(lg, IMX_PHYS + IMX_CTRL_INTR_PULSE, pulse);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_REG, IMX_PULSE_I5);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_MUX, mux | IMX_PULSE_I5);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_MASK, mask & ~IMX_PULSE_I5);
+		lg->tick_n = 0;
+		WRITE_ONCE(lg->video_phase, true);
+		lg1314_wr(lg, DE_IPC_PHYS + DE_IPC_CPU_FLAG_EN, en | DE_IPC_CPU_FLAG_IMX);
+	} else {
+		lg1314_wr(lg, DE_IPC_PHYS + DE_IPC_CPU_FLAG_EN, en & ~DE_IPC_CPU_FLAG_IMX);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_MASK, mask | IMX_PULSE_I5);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_MUX, mux & ~IMX_PULSE_I5);
+		lg1314_wr(lg, IMX_PHYS + IMX_INTR_REG, IMX_PULSE_I5);
+		WRITE_ONCE(lg->video_phase, false);
+	}
+}
+
+static int lg1314_enable_vblank(struct drm_crtc *crtc)
+{
+	lg1314_osd_vsync_irq(to_lg1314(crtc->dev), true);
+	return 0;
+}
+
+static void lg1314_disable_vblank(struct drm_crtc *crtc)
+{
+	lg1314_osd_vsync_irq(to_lg1314(crtc->dev), false);
+}
+
+static void lg1314_crtc_atomic_enable(struct drm_crtc *crtc,
+				      struct drm_atomic_state *state)
+{
+	struct lg1314_drm *lg = to_lg1314(crtc->dev);
+	struct drm_plane_state *ps = drm_atomic_get_new_plane_state(state, &lg->primary);
 	int ret;
 
 	ret = lg1314_panel_vcc(lg, true);
@@ -92,21 +241,32 @@ static void lg1314_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (ret)
 		goto err_vcc;
 
-	ret = lg1314_de_load_fw(lg);
-	if (ret)
-		goto err_ovi;
+	/*
+	 * The DE firmware is downloaded once and keeps running across display
+	 * off/on: downloading it again onto the running core leaves it unable
+	 * to take commands.
+	 */
+	if (!lg->de_fw_loaded) {
+		ret = lg1314_de_load_fw(lg);
+		if (ret)
+			goto err_ovi;
+		lg->de_fw_loaded = true;
+		if (!lg1314_de_wait_ready(lg))
+			lg1314_de_frame_lock(lg);
+	}
 
+	/* First frame before the panel lights up. */
 	lg1314_osd_enable(lg, true);
-	if (fb)
-		lg1314_osd_flip(lg, drm_fb_dma_get_gem_addr(fb, plane_state, 0),
-				fb->pitches[0], fb->width, fb->height,
-				!fb->format->has_alpha);
+	if (ps && ps->fb)
+		lg1314_osd_show(lg, ps);
+	lg1314_osd_layer(lg, ps && ps->fb);
 
 	ret = lg1314_panel_evdd(lg, true);
 	if (ret)
 		goto err_ovi;
 
 	lg->enabled = true;
+	drm_crtc_vblank_on(crtc);
 	return;
 
 err_ovi:
@@ -115,39 +275,67 @@ err_vcc:
 	lg1314_panel_vcc(lg, false);
 }
 
-static void lg1314_pipe_disable(struct drm_simple_display_pipe *pipe)
+static void lg1314_crtc_atomic_disable(struct drm_crtc *crtc,
+				       struct drm_atomic_state *state)
 {
-	struct lg1314_drm *lg = to_lg1314(pipe->crtc.dev);
+	struct lg1314_drm *lg = to_lg1314(crtc->dev);
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 
-	if (!lg->enabled)
-		return;
-	lg->enabled = false;
+	drm_crtc_vblank_off(crtc);
 
-	lg1314_osd_enable(lg, false);
-	lg1314_ovi_disable(lg);
-	lg1314_panel_evdd(lg, false);
-	lg1314_panel_vcc(lg, false);
+	if (lg->enabled) {
+		lg->enabled = false;
+		lg1314_osd_enable(lg, false);
+		lg1314_ovi_disable(lg);
+		lg1314_panel_evdd(lg, false);
+		lg1314_panel_vcc(lg, false);
+	}
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (cs->event) {
+		drm_crtc_send_vblank_event(crtc, cs->event);
+		cs->event = NULL;
+	}
+	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
-static void lg1314_pipe_update(struct drm_simple_display_pipe *pipe,
-			       struct drm_plane_state *old)
+/*
+ * Complete the flip at the next vblank, unless the video plane took the
+ * event: then it completes when the video frame is on screen.
+ */
+static void lg1314_crtc_atomic_flush(struct drm_crtc *crtc,
+				     struct drm_atomic_state *state)
 {
-	struct lg1314_drm *lg = to_lg1314(pipe->crtc.dev);
-	struct drm_plane_state *state = pipe->plane.state;
-	struct drm_framebuffer *fb = state->fb;
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_pending_vblank_event *event;
 
-	if (!lg->enabled || !fb)
-		return;
-
-	lg1314_osd_flip(lg, drm_fb_dma_get_gem_addr(fb, state, 0),
-			fb->pitches[0], fb->width, fb->height,
-			!fb->format->has_alpha);
+	spin_lock_irq(&crtc->dev->event_lock);
+	event = cs->event;
+	cs->event = NULL;
+	if (event) {
+		if (cs->active && drm_crtc_vblank_get(crtc) == 0)
+			drm_crtc_arm_vblank_event(crtc, event);
+		else
+			drm_crtc_send_vblank_event(crtc, event);
+	}
+	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
-static const struct drm_simple_display_pipe_funcs lg1314_pipe_funcs = {
-	.enable = lg1314_pipe_enable,
-	.disable = lg1314_pipe_disable,
-	.update = lg1314_pipe_update,
+static const struct drm_crtc_helper_funcs lg1314_crtc_helper_funcs = {
+	.atomic_enable = lg1314_crtc_atomic_enable,
+	.atomic_disable = lg1314_crtc_atomic_disable,
+	.atomic_flush = lg1314_crtc_atomic_flush,
+};
+
+static const struct drm_crtc_funcs lg1314_crtc_funcs = {
+	.reset = drm_atomic_helper_crtc_reset,
+	.destroy = drm_crtc_cleanup,
+	.set_config = drm_atomic_helper_set_config,
+	.page_flip = drm_atomic_helper_page_flip,
+	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	.enable_vblank = lg1314_enable_vblank,
+	.disable_vblank = lg1314_disable_vblank,
 };
 
 /* --------------------------------------------------------------- connector -- */
@@ -235,9 +423,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 	if (ret)
 		return ret;
 
-	drm->mode_config.min_width = LG1314_FB_MIN_W;
+	drm->mode_config.min_width = LG1314_VIDEO_MIN_W;
 	drm->mode_config.max_width = LG1314_PANEL_W;
-	drm->mode_config.min_height = LG1314_FB_MIN_H;
+	drm->mode_config.min_height = LG1314_VIDEO_MIN_H;
 	drm->mode_config.max_height = LG1314_PANEL_H;
 	drm->mode_config.funcs = &lg1314_mode_config_funcs;
 
@@ -247,10 +435,36 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 	if (ret)
 		return ret;
 
-	ret = drm_simple_display_pipe_init(drm, &lg->pipe, &lg1314_pipe_funcs,
-					   lg1314_formats,
-					   ARRAY_SIZE(lg1314_formats), NULL,
-					   &lg->connector);
+	ret = drm_universal_plane_init(drm, &lg->primary, 0, &lg1314_primary_funcs,
+				       lg1314_formats, ARRAY_SIZE(lg1314_formats),
+				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (ret)
+		return ret;
+	drm_plane_helper_add(&lg->primary, &lg1314_primary_helper_funcs);
+	/* The OSD sits above the video plane. */
+	ret = drm_plane_create_zpos_immutable_property(&lg->primary, 1);
+	if (ret)
+		return ret;
+
+	ret = drm_crtc_init_with_planes(drm, &lg->crtc, &lg->primary, NULL,
+					&lg1314_crtc_funcs, NULL);
+	if (ret)
+		return ret;
+	drm_crtc_helper_add(&lg->crtc, &lg1314_crtc_helper_funcs);
+
+	ret = drm_simple_encoder_init(drm, &lg->encoder, DRM_MODE_ENCODER_NONE);
+	if (ret)
+		return ret;
+	lg->encoder.possible_crtcs = drm_crtc_mask(&lg->crtc);
+	ret = drm_connector_attach_encoder(&lg->connector, &lg->encoder);
+	if (ret)
+		return ret;
+
+	ret = lg1314_video_init(lg);
+	if (ret)
+		return ret;
+
+	ret = drm_vblank_init(drm, 1);
 	if (ret)
 		return ret;
 
@@ -307,6 +521,10 @@ static int lg1314_get_de_regions(struct lg1314_drm *lg)
 
 	lg->de_fw_phys = fw.start;
 	lg->de_fw_size = resource_size(&fw);
+
+	/* The DE reads pictures from the decoded-picture and surface pools. */
+	lg->video_mem_start = min(m->vdec_dpb.start, m->scanout.start);
+	lg->video_mem_end = max(m->vdec_dpb.end, m->scanout.end) + 1;
 	return 0;
 }
 
@@ -336,6 +554,10 @@ static int lg1314_probe(struct platform_device *pdev)
 		return PTR_ERR(lg);
 	lg->dev = dev;
 	platform_set_drvdata(pdev, lg);
+
+	ret = drmm_mutex_init(&lg->drm, &lg->de_lock);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < LG1314_REG_COUNT; i++) {
 		lg->mmio[i].phys = lg1314_regions[i].phys;
@@ -369,7 +591,26 @@ static int lg1314_probe(struct platform_device *pdev)
 
 	ret = lg1314_init_mode_config(lg);
 	if (ret)
-		goto err_micom;
+		goto err_video;
+
+	lg->irq = platform_get_irq(pdev, 0);
+	if (lg->irq < 0) {
+		ret = lg->irq;
+		goto err_video;
+	}
+	lg1314_osd_vsync_irq(lg, false);
+	ret = devm_request_irq(dev, lg->irq, lg1314_vsync_irq, IRQF_SHARED,
+			       "lg1314-vsync", lg);
+	if (ret)
+		goto err_video;
+
+	ret = platform_get_irq(pdev, 1);
+	if (ret < 0)
+		goto err_video;
+	ret = devm_request_irq(dev, ret, lg1314_video_tick_irq, IRQF_SHARED,
+			       "lg1314-video-tick", lg);
+	if (ret)
+		goto err_video;
 
 	/*
 	 * Evict any firmware framebuffer before we take over the display.
@@ -380,15 +621,18 @@ static int lg1314_probe(struct platform_device *pdev)
 	 */
 	ret = aperture_remove_all_conflicting_devices(lg1314_drm_driver.name);
 	if (ret)
-		goto err_micom;
+		goto err_video;
 
 	ret = drm_dev_register(&lg->drm, 0);
 	if (ret)
-		goto err_micom;
+		goto err_video;
+	lg1314_de_debugfs_init(lg);
 
 	drm_client_setup(&lg->drm, NULL);
 	return 0;
 
+err_video:
+	lg1314_video_fini(lg);
 err_micom:
 	put_device(&lg->micom->dev);
 	return ret;
@@ -400,6 +644,7 @@ static void lg1314_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&lg->drm);
 	drm_atomic_helper_shutdown(&lg->drm);
+	lg1314_video_fini(lg);
 	put_device(&lg->micom->dev);
 }
 

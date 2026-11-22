@@ -7,12 +7,22 @@
 #ifndef _LG1314_DRM_H_
 #define _LG1314_DRM_H_
 
+#include <linux/bits.h>
 #include <linux/types.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
-#include <drm/drm_device.h>
-#include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_crtc.h>
+#include <drm/drm_device.h>
+#include <drm/drm_encoder.h>
+#include <drm/drm_plane.h>
+#include <linux/mutex.h>
+#include <linux/workqueue.h>
+
+struct drm_framebuffer;
+struct drm_pending_vblank_event;
+struct lg1314_vdec;
+struct lg1314_vdec_vo;
 
 /* MMIO regions (the bring-up tables use absolute phys addresses). */
 enum lg1314_region {
@@ -22,6 +32,7 @@ enum lg1314_region {
 	LG1314_REG_DE_IPC,	/* 0xc9026000 : DE IPC / firmware download    */
 	LG1314_REG_DPE,		/* 0xc9020000 : DPE path enable              */
 	LG1314_REG_PLL,		/* 0xc9c10000 : DISP PLL                      */
+	LG1314_REG_IMX,		/* 0xc9014000 : DE input mux / sync pulses    */
 	LG1314_REG_COUNT
 };
 
@@ -45,6 +56,29 @@ struct lg1314_mmio {
 #define OSD_EN				BIT(0)
 #define OSD_SYNC_EN			BIT(0)
 #define OSD_HDR_READY			BIT(29)		/* osd_hdr_ready_flag */
+
+/* OSD mixer vsync interrupt (GIC SPI 72): fires every panel refresh. */
+#define OSD_IRQ_PHYS			0xc9010144	/* osd_common_ctrl_irq */
+#define OSD_IRQ_BOSD_EN			BIT(24)		/* blend-OSD mixer */
+#define OSD_IRQ_BOSD_PENDING		BIT(8)		/* write 1 to clear */
+#define OSD_IRQ_PENDING_MASK		GENMASK(15, 8)
+
+/*
+ * DE sync pulse i5, set to follow the video source (the decoder output's
+ * tick): its status bit marks the panel refreshes where a video frame can
+ * change. Routed to the CPU side without raising an interrupt.
+ */
+#define DE_IPC_CPU_FLAG			0x68	/* DE -> CPU interrupt sources */
+#define DE_IPC_CPU_FLAG_EN		0x6c
+#define DE_IPC_CPU_FLAG_IMX		BIT(1)
+#define IMX_PHYS			0xc9014000
+#define IMX_CTRL_INTR_PULSE		0x0c	/* per pulse: idx[2:0], sel[3] */
+#define IMX_INTR_REG			0x10	/* status, write 1 to clear */
+#define IMX_INTR_MASK			0x14
+#define IMX_INTR_MUX			0x18	/* 1: to the CPU side */
+#define IMX_PULSE_I5			BIT(5)
+#define IMX_PULSE_I5_CFG		GENMASK(23, 20)
+#define IMX_PULSE_SRC0			0	/* source, index 0 */
 
 /* osd0 register (bank + OSD0_CTRL_BASE + field) */
 #define OSD0(field)			(OSD0_CTRL_BASE + (field))
@@ -109,7 +143,14 @@ struct lg1314_mmio {
 #define DE_IPC_ADR5_HI			0x2c
 #define DE_IPC_CTRL_HOLD		BIT(0)
 #define DE_IPC_CTRL_B1			BIT(1)
+#define DE_IPC_EXT_STATUS		0x10	/* firmware -> host interrupts */
+#define DE_IPC_EXT_CLEAR		0x14
+#define DE_IPC_INT_EVENT		0x18	/* host -> firmware interrupts */
+#define DE_IPC_MBOX_IRQ			BIT(21)	/* mailbox doorbell, both directions */
 #define DE_IPC_TAG			0x100	/* memory layout table, read by the firmware */
+#define DE_IPC_MBOX_TX			0x100	/* host -> firmware mailbox */
+#define DE_IPC_MBOX_RX			0x180	/* firmware -> host mailbox */
+#define DE_IPC_MBOX_SIZE		0x80
 #define DE_FW_DDR_MIN			0x50000000u	/* ADR5 must be >= this */
 #define DE_FW_NAME			"lg1314/de_fw.bin"
 
@@ -124,14 +165,57 @@ struct lg1314_mmio {
 #define LG1314_FB_H			1080
 #define LG1314_FB_MIN_W			1280
 #define LG1314_FB_MIN_H			720
+/* Smallest video-plane picture (and so the device's framebuffer minimum). */
+#define LG1314_VIDEO_MIN_W		64
+#define LG1314_VIDEO_MIN_H		64
+
+/* A display-engine window rectangle. */
+struct lg1314_de_rect {
+	u16 w, h, x, y;
+};
+
+/* The video plane (lg1314_video.c). */
+struct lg1314_video {
+	struct drm_plane		plane;
+	struct device_node		*vdec_np;
+	struct lg1314_vdec		*vdec;	/* once available */
+	struct lg1314_vdec_vo		*vo;	/* while the plane is on */
+
+	u32				next_id;
+	struct {
+		u32			id;
+		struct drm_framebuffer	*fb;
+	}				held[8];	/* not yet off screen */
+	struct mutex			held_lock;
+
+	/* output tick rate in mHz, calibrated so the tick is 60 Hz */
+	unsigned int			rate_mhz;
+	struct delayed_work		calib_work;
+	unsigned int			calib_passes;
+
+	/* display-engine window state */
+	bool				src_set;
+	bool				blanked;
+	struct lg1314_de_rect		in, out;
+};
 
 struct lg1314_drm {
 	struct drm_device		drm;
 	struct device			*dev;
 	struct lg1314_mmio		mmio[LG1314_REG_COUNT];
 
-	struct drm_simple_display_pipe	pipe;
+	struct drm_crtc			crtc;
+	struct drm_plane		primary;	/* the OSD */
+	struct drm_encoder		encoder;
 	struct drm_connector		connector;
+
+	/* vblank: every other OSD mixer vsync (panel refresh is twice the mode's) */
+	int				irq;
+	unsigned int			vsync_count;
+	bool				video_phase;	/* vblank at video ticks */
+	/* video tick timing, for calibrating the output's rate */
+	unsigned int			tick_n;
+	u64				tick_first_ns, tick_last_ns;
 
 	/* panel power sequencing */
 	struct i2c_client		*micom;
@@ -151,6 +235,15 @@ struct lg1314_drm {
 		u32			model;
 	} de_mem;
 
+	bool				de_fw_loaded;
+
+	struct lg1314_video		video;
+	u32				video_mem_start;	/* pictures the DE */
+	u32				video_mem_end;		/* can read */
+
+	/* DE firmware command mailbox */
+	struct mutex			de_lock;
+
 	/* channel-power register value preserved from lxboot at probe */
 	u32				chpower_save;
 	bool				enabled;
@@ -167,11 +260,22 @@ u32  lg1314_rd(struct lg1314_drm *lg, u32 phys);
 int  lg1314_ovi_enable(struct lg1314_drm *lg);
 void lg1314_ovi_disable(struct lg1314_drm *lg);
 int  lg1314_de_load_fw(struct lg1314_drm *lg);
+int  lg1314_de_cmd(struct lg1314_drm *lg, u32 cmd, const void *data, size_t len);
+int  lg1314_de_query(struct lg1314_drm *lg, u32 cmd, void *out, size_t len);
+int  lg1314_de_wait_ready(struct lg1314_drm *lg);
+int  lg1314_de_frame_lock(struct lg1314_drm *lg);
+void lg1314_de_debugfs_init(struct lg1314_drm *lg);
+int  lg1314_video_init(struct lg1314_drm *lg);
+void lg1314_video_fini(struct lg1314_drm *lg);
 int  lg1314_panel_vcc(struct lg1314_drm *lg, bool on);
 int  lg1314_panel_evdd(struct lg1314_drm *lg, bool on);
 void lg1314_osd_init(struct lg1314_drm *lg);
 void lg1314_osd_enable(struct lg1314_drm *lg, bool on);
+void lg1314_osd_layer(struct lg1314_drm *lg, bool on);
 void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 		     u32 w, u32 h, bool opaque);
+void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
+bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
+void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 
 #endif /* _LG1314_DRM_H_ */

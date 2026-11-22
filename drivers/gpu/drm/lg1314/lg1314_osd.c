@@ -63,6 +63,13 @@ void lg1314_osd_enable(struct lg1314_drm *lg, bool on)
 	lg1314_wr(lg, OSD0_REG(OSD_CTRL_SYNC0), sync);
 }
 
+/* Show or hide the OSD layer, leaving its sync (and the vsync interrupt the
+ * display's vblank comes from) running. */
+void lg1314_osd_layer(struct lg1314_drm *lg, bool on)
+{
+	osd_rmw(lg, OSD0_REG(OSD_CTRL_MAIN), OSD_EN, on ? OSD_EN : 0);
+}
+
 /*
  * Build the 7-word OSD header (FBDEV_M19_OSD_HDR_T) and latch it. The plane
  * input is the framebuffer (w x h); the output is the full panel, so the SR
@@ -105,4 +112,25 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 
 	lg1314_wr(lg, OSD0_REG(OSD_CTRL_MAIN),
 		  lg1314_rd(lg, OSD0_REG(OSD_CTRL_MAIN)) | OSD_HDR_READY);
+}
+
+/* Enable or disable the mixer vsync interrupt, dropping a stale one. */
+void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on)
+{
+	u32 v = lg1314_rd(lg, OSD_IRQ_PHYS) & ~OSD_IRQ_PENDING_MASK;
+
+	v = on ? v | OSD_IRQ_BOSD_EN : v & ~OSD_IRQ_BOSD_EN;
+	lg1314_wr(lg, OSD_IRQ_PHYS, v | OSD_IRQ_BOSD_PENDING);
+}
+
+/* Clear a pending mixer vsync; false if there was none. */
+bool lg1314_osd_vsync_ack(struct lg1314_drm *lg)
+{
+	u32 v = lg1314_rd(lg, OSD_IRQ_PHYS);
+
+	if (!(v & OSD_IRQ_BOSD_PENDING))
+		return false;
+	lg1314_wr(lg, OSD_IRQ_PHYS,
+		  (v & ~OSD_IRQ_PENDING_MASK) | OSD_IRQ_BOSD_PENDING);
+	return true;
 }

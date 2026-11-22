@@ -15,6 +15,10 @@
  *    buffer (CPB), once GET_NOTI_INFO / GET_CPB_INFO have reported them.
  *  - poll() reports the readiness the firmware last announced.
  *
+ * /dev/lxvo does the same for the firmware's video output (picture display):
+ * each open file is one output instance, ioctls are the firmware's VO
+ * commands, and poll() follows the output's readiness. It has no mmap.
+ *
  * Unbinding the device while the file is open is not supported.
  */
 
@@ -51,6 +55,7 @@ struct pt_buffer_info {
 struct lg1314_vdec_pt {
 	struct lg1314_vdec	*v;
 	struct miscdevice	misc;
+	struct miscdevice	misc_vo;
 	spinlock_t		lock;		/* protects files */
 	struct list_head	files;
 };
@@ -58,7 +63,8 @@ struct lg1314_vdec_pt {
 struct pt_file {
 	struct list_head	list;
 	struct lg1314_vdec_pt	*pt;
-	u32			handle;		/* the firmware's decoder */
+	u32			handle;		/* the firmware's decoder or output */
+	bool			vo;		/* an output (/dev/lxvo) */
 	u32			poll;		/* FW_POLL* */
 	wait_queue_head_t	wait;
 
@@ -69,10 +75,15 @@ struct pt_file {
 	u32			cpb_size;
 };
 
+static const struct file_operations pt_vo_fops;
+
 static int pt_open(struct inode *inode, struct file *f)
 {
-	struct lg1314_vdec_pt *pt = container_of(f->private_data,
-						 struct lg1314_vdec_pt, misc);
+	struct miscdevice *misc = f->private_data;
+	bool vo = misc->fops == &pt_vo_fops;
+	struct lg1314_vdec_pt *pt = vo ?
+		container_of(misc, struct lg1314_vdec_pt, misc_vo) :
+		container_of(misc, struct lg1314_vdec_pt, misc);
 	struct pt_file *pf;
 	int ret, handle;
 
@@ -80,11 +91,13 @@ static int pt_open(struct inode *inode, struct file *f)
 	if (!pf)
 		return -ENOMEM;
 	pf->pt = pt;
+	pf->vo = vo;
 	pf->poll = FW_POLLOUT;
 	init_waitqueue_head(&pf->wait);
 	mutex_init(&pf->lock);
 
-	ret = lg1314_vdec_call(pt->v, VDEC_CALL_VDEC_OPEN, 0, NULL, 0, 0, &handle);
+	ret = lg1314_vdec_call(pt->v, vo ? VDEC_CALL_VO_OPEN : VDEC_CALL_VDEC_OPEN,
+			       0, NULL, 0, 0, &handle);
 	if (!ret && !handle)
 		ret = -EIO;
 	if (ret) {
@@ -110,7 +123,8 @@ static int pt_release(struct inode *inode, struct file *f)
 	list_del(&pf->list);
 	spin_unlock_irq(&pt->lock);
 
-	lg1314_vdec_call(pt->v, VDEC_CALL_VDEC_CLOSE, pf->handle, NULL, 0, 0, &result);
+	lg1314_vdec_call(pt->v, pf->vo ? VDEC_CALL_VO_CLOSE : VDEC_CALL_VDEC_CLOSE,
+			 pf->handle, NULL, 0, 0, &result);
 	kfree(pf);
 	return 0;
 }
@@ -167,7 +181,9 @@ static long pt_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			dir |= VDEC_CALL_RD;
 	}
 
-	ret = lg1314_vdec_call(pf->pt->v, VDEC_CALL_VDEC_IOCTL, pf->handle,
+	ret = lg1314_vdec_call(pf->pt->v,
+			       pf->vo ? VDEC_CALL_VO_IOCTL : VDEC_CALL_VDEC_IOCTL,
+			       pf->handle,
 			       data, 2 * sizeof(u32) + size, dir, &result);
 	if (ret)
 		goto out;
@@ -175,7 +191,7 @@ static long pt_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		ret = -EFAULT;
 		goto out;
 	}
-	if (result >= 0 && size == sizeof(struct pt_buffer_info))
+	if (!pf->vo && result >= 0 && size == sizeof(struct pt_buffer_info))
 		pt_note_buffers(pf, cmd, (struct pt_buffer_info *)(data + 2));
 	ret = result;
 out:
@@ -190,6 +206,9 @@ static int pt_mmap(struct file *f, struct vm_area_struct *vma)
 	size_t len = vma->vm_end - vma->vm_start;
 	phys_addr_t phys = 0;
 	u32 size = 0;
+
+	if (pf->vo)
+		return -ENODEV;
 
 	mutex_lock(&pf->lock);
 	if (vma->vm_pgoff == 0) {
@@ -236,6 +255,14 @@ static const struct file_operations pt_fops = {
 	.poll		= pt_poll_wait,
 };
 
+static const struct file_operations pt_vo_fops = {
+	.owner		= THIS_MODULE,
+	.open		= pt_open,
+	.release	= pt_release,
+	.unlocked_ioctl	= pt_ioctl,
+	.poll		= pt_poll_wait,
+};
+
 void lg1314_vdec_pt_poll(struct lg1314_vdec_pt *pt, u32 handle, u32 mask)
 {
 	struct pt_file *pf;
@@ -269,13 +296,23 @@ struct lg1314_vdec_pt *lg1314_vdec_pt_init(struct lg1314_vdec *v)
 	pt->misc.mode = 0600;
 	pt->misc.parent = lg1314_vdec_device(v);
 
+	pt->misc_vo = pt->misc;
+	pt->misc_vo.name = "lxvo";
+	pt->misc_vo.fops = &pt_vo_fops;
+
 	ret = misc_register(&pt->misc);
 	if (ret) {
 		kfree(pt);
 		return ERR_PTR(ret);
 	}
+	ret = misc_register(&pt->misc_vo);
+	if (ret) {
+		misc_deregister(&pt->misc);
+		kfree(pt);
+		return ERR_PTR(ret);
+	}
 	dev_warn(lg1314_vdec_device(v),
-		 "raw decoder interface /dev/lxvdec enabled (development only)\n");
+		 "raw decoder interfaces /dev/lxvdec, /dev/lxvo enabled (development only)\n");
 	return pt;
 }
 
@@ -283,6 +320,7 @@ void lg1314_vdec_pt_exit(struct lg1314_vdec_pt *pt)
 {
 	if (!pt)
 		return;
+	misc_deregister(&pt->misc_vo);
 	misc_deregister(&pt->misc);
 	kfree(pt);
 }
