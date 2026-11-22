@@ -54,8 +54,45 @@ struct lg1314_mmio {
 #define OSD_CTRL_HDR0			0x20		/* 7 consecutive u32: hdr0..hdr6 */
 #define OSD_CTRL_SYNC0			0x40		/* osd_sync_enable = BIT(0) */
 #define OSD_EN				BIT(0)
+#define OSD_BITMAP_ONLY			BIT(6)		/* osd_bitmap_only_mode_en */
 #define OSD_SYNC_EN			BIT(0)
 #define OSD_HDR_READY			BIT(29)		/* osd_hdr_ready_flag */
+#define OSD_BASE_ADDR			0x04
+#define OSD_CTRL_SWAP			0x08
+#define OSD_CTRL_PDEC			0x0c
+#define OSD_PDEC_CH_MASK		GENMASK(31, 24)	/* osd_ch_{alpha,red,green,blue} */
+
+/*
+ * AFBC scanout (OSD0 only). Values are the ones stock webOS runs with (live
+ * register dump), which match the GPL FBDEV_M19_CMN_SetupFBC/WriteFBCHdrRegs.
+ * Linear values are what lxboot leaves and the GPL raw-mode defaults.
+ */
+#define OSD_TOP_CTRL_DPATH		0x20
+#define OSD_DPATH_AFBC_EN		BIT(20)		/* osd0_afbc_en */
+#define OSD_TOP_AUTO_INIT_AFBC		0x38
+#define OSD_AUTO_INIT_AFBC_ON		0x10000011	/* afbc0 init + auto init */
+#define OSD_SWAP_LINEAR			0x00000333
+#define OSD_SWAP_AFBC			0x00000000
+#define OSD_PDEC_CH_LINEAR		0x1b000000	/* a0 r1 g2 b3 */
+#define OSD_PDEC_CH_AFBC		0xe4000000	/* a3 r2 g1 b0 */
+
+#define OSD_AFBC_PHYS			0xc9010700
+#define AFBC_CTRL0			0x00
+#define AFBC_CTRL0_CFG			0x420c0000	/* run_mode, pl_addr_mode,
+							 * update_ready_flag_en, wrap_en */
+#define AFBC_CTRL0_UPDATE		BIT(26)		/* update_ready_flag */
+#define AFBC_HD_BASE			0x04
+#define AFBC_START			0x08		/* start_x | start_y << 16 */
+#define AFBC_END			0x0c		/* end_x | end_y << 16 */
+#define AFBC_IMG_WIDTH			0x10
+#define AFBC_BUF_DEPTH			0x14
+#define AFBC_BUF_DEPTH_VAL		0x03bf00ff	/* dec 959, pl 255 (HW fixed) */
+#define AFBC_PL_BASE			0x20
+#define AFBC_PL_END			0x24
+#define AFBC_CTRL_C			0x30
+#define AFBC_CTRL_C_VAL			0x0011ff54	/* endian/gmau ids, "HW test value" */
+#define AFBC_DEFAULT			0xd0
+#define AFBC_DEFAULT_VAL		0xffffffff
 
 /* OSD mixer vsync interrupt (GIC SPI 72): fires every panel refresh. */
 #define OSD_IRQ_PHYS			0xc9010144	/* osd_common_ctrl_irq */
@@ -273,7 +310,7 @@ void lg1314_osd_init(struct lg1314_drm *lg);
 void lg1314_osd_enable(struct lg1314_drm *lg, bool on);
 void lg1314_osd_layer(struct lg1314_drm *lg, bool on);
 void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
-		     u32 w, u32 h, bool opaque);
+		     u32 w, u32 h, bool opaque, bool afbc);
 void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);

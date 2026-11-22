@@ -10,6 +10,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic.h>
@@ -23,6 +24,7 @@
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
@@ -86,12 +88,45 @@ static const u32 lg1314_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
+/*
+ * AFBC scanout: Arm 16x16 superblocks, sparse body. That is what stock webOS
+ * scans and what Panfrost renders on Midgard. With stock's decoder settings
+ * a YTR buffer shows garbage (no YTR enable is known), so only the plain
+ * variant is offered, and only for ARGB8888: Panfrost's XRGB8888 AFBC comes
+ * out with blue lost whatever the OSD's channel order (cfw/4k-osd.md).
+ */
+#define LG1314_AFBC_MOD	DRM_FORMAT_MOD_ARM_AFBC(AFBC_FORMAT_MOD_BLOCK_SIZE_16x16 | \
+						AFBC_FORMAT_MOD_SPARSE)
+/*
+ * Off by default: Kodi renders one ARGB AFBC surface and registers it as
+ * XRGB8888 while no video plays, and AFBC mode ignores hdr3's global alpha,
+ * so its GUI comes out tinted (cfw/4k-osd.md, pass 6).
+ */
+static bool afbc;
+module_param(afbc, bool, 0444);
+MODULE_PARM_DESC(afbc, "Offer AFBC scanout (ARGB8888) on the OSD plane (default off)");
+
+static const u64 lg1314_primary_modifiers[] = {
+	LG1314_AFBC_MOD,
+	DRM_FORMAT_MOD_LINEAR,
+	DRM_FORMAT_MOD_INVALID,
+};
+
+static bool lg1314_primary_format_mod_supported(struct drm_plane *plane,
+						u32 format, u64 modifier)
+{
+	return modifier == DRM_FORMAT_MOD_LINEAR ||
+	       (afbc && modifier == LG1314_AFBC_MOD &&
+		format == DRM_FORMAT_ARGB8888);
+}
+
 static void lg1314_osd_show(struct lg1314_drm *lg, struct drm_plane_state *ps)
 {
 	struct drm_framebuffer *fb = ps->fb;
 
 	lg1314_osd_flip(lg, drm_fb_dma_get_gem_addr(fb, ps, 0), fb->pitches[0],
-			fb->width, fb->height, !fb->format->has_alpha);
+			fb->width, fb->height, !fb->format->has_alpha,
+			drm_is_afbc(fb->modifier));
 }
 
 /* ---- primary plane (OSD) ---- */
@@ -109,6 +144,16 @@ static int lg1314_primary_atomic_check(struct drm_plane *plane,
 		return 0;
 	if (fb->width < LG1314_FB_MIN_W || fb->height < LG1314_FB_MIN_H)
 		return -EINVAL;
+	/*
+	 * A 3840-wide AFBC plane hangs the decoder partway through the frame
+	 * (cfw/4k-osd.md, pass 6). Unsolved, so AFBC is limited to the
+	 * SR-scaled sizes.
+	 */
+	if (drm_is_afbc(fb->modifier) && fb->width > LG1314_FB_W) {
+		drm_dbg_kms(plane->dev, "AFBC wider than %u not supported\n",
+			    LG1314_FB_W);
+		return -EINVAL;
+	}
 
 	cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
 	return drm_atomic_helper_check_plane_state(ps, cs, DRM_PLANE_NO_SCALING,
@@ -142,6 +187,7 @@ static const struct drm_plane_funcs lg1314_primary_funcs = {
 	.reset = drm_atomic_helper_plane_reset,
 	.atomic_duplicate_state = drm_atomic_helper_plane_duplicate_state,
 	.atomic_destroy_state = drm_atomic_helper_plane_destroy_state,
+	.format_mod_supported = lg1314_primary_format_mod_supported,
 };
 
 /* ---- CRTC ---- */
@@ -395,8 +441,43 @@ static const struct drm_connector_funcs lg1314_conn_funcs = {
 
 /* ------------------------------------------------------------------- driver -- */
 
+static const struct drm_framebuffer_funcs lg1314_fb_funcs = {
+	.destroy = drm_gem_fb_destroy,
+	.create_handle = drm_gem_fb_create_handle,
+};
+
+/* drm_gem_fb_create, plus the AFBC size checks for AFBC framebuffers. */
+static struct drm_framebuffer *
+lg1314_fb_create(struct drm_device *dev, struct drm_file *file,
+		 const struct drm_format_info *info,
+		 const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	struct drm_afbc_framebuffer *afbc_fb;
+	int ret;
+
+	afbc_fb = kzalloc(sizeof(*afbc_fb), GFP_KERNEL);
+	if (!afbc_fb)
+		return ERR_PTR(-ENOMEM);
+
+	ret = drm_gem_fb_init_with_funcs(dev, &afbc_fb->base, file, info,
+					 mode_cmd, &lg1314_fb_funcs);
+	if (ret) {
+		kfree(afbc_fb);
+		return ERR_PTR(ret);
+	}
+
+	if (drm_is_afbc(mode_cmd->modifier[0])) {
+		ret = drm_gem_fb_afbc_init(dev, info, mode_cmd, afbc_fb);
+		if (ret) {
+			drm_framebuffer_put(&afbc_fb->base);
+			return ERR_PTR(ret);
+		}
+	}
+	return &afbc_fb->base;
+}
+
 static const struct drm_mode_config_funcs lg1314_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create,
+	.fb_create = lg1314_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -437,7 +518,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 
 	ret = drm_universal_plane_init(drm, &lg->primary, 0, &lg1314_primary_funcs,
 				       lg1314_formats, ARRAY_SIZE(lg1314_formats),
-				       NULL, DRM_PLANE_TYPE_PRIMARY, NULL);
+				       afbc ? lg1314_primary_modifiers :
+					      lg1314_primary_modifiers + 1,
+				       DRM_PLANE_TYPE_PRIMARY, NULL);
 	if (ret)
 		return ret;
 	drm_plane_helper_add(&lg->primary, &lg1314_primary_helper_funcs);
@@ -543,11 +626,29 @@ static int lg1314_get_micom(struct lg1314_drm *lg)
 	return 0;
 }
 
+static void lg1314_release_rmem(void *dev)
+{
+	of_reserved_mem_device_release(dev);
+}
+
 static int lg1314_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct lg1314_drm *lg;
 	int ret, i;
+
+	/*
+	 * Scanout buffers come from the "scanout" pool (idx 0). -EBUSY: the
+	 * pool is still attached from an earlier binding that didn't release
+	 * it (older builds of this driver); it's the same pool, so carry on.
+	 * Attached before the DRM device, so it is released after it.
+	 */
+	ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, 0);
+	if (ret && ret != -EBUSY)
+		return dev_err_probe(dev, ret, "no scanout memory region\n");
+	ret = devm_add_action_or_reset(dev, lg1314_release_rmem, dev);
+	if (ret)
+		return ret;
 
 	lg = devm_drm_dev_alloc(dev, &lg1314_drm_driver, struct lg1314_drm, drm);
 	if (IS_ERR(lg))
@@ -575,11 +676,6 @@ static int lg1314_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-
-	/* Scanout buffers come from the "scanout" pool (idx 0). */
-	ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, 0);
-	if (ret)
-		return dev_err_probe(dev, ret, "no scanout memory region\n");
 
 	/* The DE firmware image and working-memory regions. */
 	ret = lg1314_get_de_regions(lg);

@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /* LG1314 OSD0 graphics plane: HW init, scanout header, enable. */
 
+#include <linux/sizes.h>
+
 #include "lg1314_drm.h"
 
 #define OSD0_REG(field)		(OSD_BANK_PHYS + OSD0_CTRL_BASE + (field))
+#define AFBC_REG(field)		(OSD_AFBC_PHYS + (field))
 
 static void osd_rmw(struct lg1314_drm *lg, u32 phys, u32 mask, u32 val)
 {
@@ -71,17 +74,72 @@ void lg1314_osd_layer(struct lg1314_drm *lg, bool on)
 }
 
 /*
+ * Switch OSD0 between linear and AFBC scanout (FBDEV_M19_CMN_SetupFBC): the
+ * AFBC decoder path, its auto init, bitmap-only mode, and the byte/channel
+ * order the decoder output needs. Only on change.
+ */
+static void osd_set_afbc(struct lg1314_drm *lg, bool afbc)
+{
+	u32 dpath = lg1314_rd(lg, OSD_TOP_PHYS + OSD_TOP_CTRL_DPATH);
+
+	if (!!(dpath & OSD_DPATH_AFBC_EN) == afbc)
+		return;
+
+	lg1314_wr(lg, OSD_TOP_PHYS + OSD_TOP_CTRL_DPATH,
+		  afbc ? dpath | OSD_DPATH_AFBC_EN : dpath & ~OSD_DPATH_AFBC_EN);
+	lg1314_wr(lg, OSD_TOP_PHYS + OSD_TOP_AUTO_INIT_AFBC,
+		  afbc ? OSD_AUTO_INIT_AFBC_ON : 0);
+	lg1314_wr(lg, OSD0_REG(OSD_CTRL_SWAP),
+		  afbc ? OSD_SWAP_AFBC : OSD_SWAP_LINEAR);
+	osd_rmw(lg, OSD0_REG(OSD_CTRL_PDEC), OSD_PDEC_CH_MASK,
+		afbc ? OSD_PDEC_CH_AFBC : OSD_PDEC_CH_LINEAR);
+	osd_rmw(lg, OSD0_REG(OSD_CTRL_MAIN), OSD_BITMAP_ONLY,
+		afbc ? OSD_BITMAP_ONLY : 0);
+}
+
+/*
+ * Point the AFBC decoder at a 16x16-superblock buffer (header at @fb_phys,
+ * body offsets relative to it) and request the update
+ * (FBDEV_M19_CMN_WriteFBCHdrRegs + FlushFBCHdrRegs).
+ */
+static void osd_afbc_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
+			  u32 w, u32 h)
+{
+	u32 hdr_size = ALIGN(DIV_ROUND_UP(w, 16) * DIV_ROUND_UP(h, 16) * 16, SZ_1K);
+
+	/* Stock sets this to the body; the decoder doesn't use it. */
+	lg1314_wr(lg, OSD0_REG(OSD_BASE_ADDR), fb_phys + hdr_size);
+
+	lg1314_wr(lg, AFBC_REG(AFBC_HD_BASE), fb_phys);
+	lg1314_wr(lg, AFBC_REG(AFBC_PL_BASE), fb_phys);	/* same as header */
+	lg1314_wr(lg, AFBC_REG(AFBC_PL_END), 0xffffffff);
+	lg1314_wr(lg, AFBC_REG(AFBC_START), 0);
+	lg1314_wr(lg, AFBC_REG(AFBC_END),
+		  (ALIGN(w - 2, 2) & 0xfff) | (((h - 1) & 0xfff) << 16));
+	lg1314_wr(lg, AFBC_REG(AFBC_IMG_WIDTH), (pitch / 4) & 0xfff);
+	lg1314_wr(lg, AFBC_REG(AFBC_BUF_DEPTH), AFBC_BUF_DEPTH_VAL);
+	lg1314_wr(lg, AFBC_REG(AFBC_CTRL_C), AFBC_CTRL_C_VAL);
+	lg1314_wr(lg, AFBC_REG(AFBC_DEFAULT), AFBC_DEFAULT_VAL);
+	lg1314_wr(lg, AFBC_REG(AFBC_CTRL0), AFBC_CTRL0_CFG);
+}
+
+/*
  * Build the 7-word OSD header (FBDEV_M19_OSD_HDR_T) and latch it. The plane
  * input is the framebuffer (w x h); the output is the full panel, so the SR
  * block scales 1920x1080 -> 3840x2160. wpl is the stride in 8-byte OSD words.
+ * For AFBC (up to 1920 wide, see lg1314_primary_atomic_check), @fb_phys
+ * is the header and @pitch the pixel-row pitch of the superblock-aligned
+ * width.
  */
 void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
-		     u32 w, u32 h, bool opaque)
+		     u32 w, u32 h, bool opaque, bool afbc)
 {
 	u32 hdr[7];
 	u32 wpl = pitch >> 3;
 	u32 scaler, want;
 	int i;
+
+	osd_set_afbc(lg, afbc);
 
 	hdr[0] = 0;						/* ypos | xpos<<16 | ckey_en */
 	hdr[1] = (h & 0xfff) | ((w & 0xfff) << 16);		/* h_mem | w_mem (input) */
@@ -110,8 +168,15 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 	if (want != scaler)
 		lg1314_wr(lg, OSD0_REG(OSD_CTRL_SCALER), want);
 
+	if (afbc)
+		osd_afbc_flip(lg, fb_phys, pitch, w, h);
+
 	lg1314_wr(lg, OSD0_REG(OSD_CTRL_MAIN),
 		  lg1314_rd(lg, OSD0_REG(OSD_CTRL_MAIN)) | OSD_HDR_READY);
+
+	if (afbc)
+		lg1314_wr(lg, AFBC_REG(AFBC_CTRL0),
+			  AFBC_CTRL0_CFG | AFBC_CTRL0_UPDATE);
 }
 
 /* Enable or disable the mixer vsync interrupt, dropping a stale one. */

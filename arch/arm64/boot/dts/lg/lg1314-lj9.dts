@@ -74,11 +74,15 @@
 			no-map;
 		};
 
-		/* Graphics surfaces: the scanout DMA pool. */
+		/*
+		 * Graphics surfaces: the scanout pool. CMA rather than a no-map
+		 * coherent pool: that one rounds each buffer up to a power of
+		 * two, so a 4K AFBC buffer (32 MiB + header) would take 64 MiB.
+		 */
 		gfx_surface: gfx-surface@65c00000 {
 			compatible = "shared-dma-pool";
 			reg = <0x65c00000 0x07c00000>;
-			no-map;
+			reusable;
 		};
 
 		kdrv-misc@6d800000 {
