@@ -77,6 +77,7 @@ struct de_win_blank {
 static const u32 video_formats[] = { DRM_FORMAT_NV12 };
 static const u64 video_modifiers[] = {
 	DRM_FORMAT_MOD_LINEAR,
+	LG1314_FORMAT_MOD_NV12_8X4,	/* decoder pictures only */
 	DRM_FORMAT_MOD_INVALID,
 };
 
@@ -335,12 +336,19 @@ static void video_atomic_update(struct drm_plane *plane,
 		.crop_top = ps->src.y1 >> 16,
 		.crop_right = fb->width - (ps->src.x2 >> 16),
 		.crop_bottom = fb->height - (ps->src.y2 >> 16),
+		.tiled = fb->modifier == LG1314_FORMAT_MOD_NV12_8X4,
 	};
 	if (video_hold(v, fb, f.id)) {
 		drm_err(plane->dev, "video: too many frames in flight\n");
 		return;
 	}
 	ret = lg1314_vdec_vo_write(v->vo, &f);
+	if (ret == -ENOENT) {
+		/* a decoder picture that's no longer there: keep the last one */
+		drm_dbg_kms(plane->dev, "video frame %u gone, dropped\n", f.id);
+		video_released(v, f.id);
+		return;
+	}
 	if (ret) {
 		drm_err(plane->dev, "video frame write failed: %d\n", ret);
 		video_released(v, f.id);
@@ -377,7 +385,9 @@ static const struct drm_plane_helper_funcs video_helper_funcs = {
 static bool video_format_mod_supported(struct drm_plane *plane, u32 format,
 				       u64 modifier)
 {
-	return format == DRM_FORMAT_NV12 && modifier == DRM_FORMAT_MOD_LINEAR;
+	return format == DRM_FORMAT_NV12 &&
+	       (modifier == DRM_FORMAT_MOD_LINEAR ||
+		modifier == LG1314_FORMAT_MOD_NV12_8X4);
 }
 
 static const struct drm_plane_funcs video_plane_funcs = {

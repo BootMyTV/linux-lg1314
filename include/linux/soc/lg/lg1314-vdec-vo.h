@@ -8,6 +8,15 @@
 #define _LINUX_SOC_LG_LG1314_VDEC_VO_H
 
 #include <linux/types.h>
+#include <linux/videodev2.h>
+
+/*
+ * The decoder's tiled picture layout (8x4 tiles, NV12 sizes and offsets): a
+ * V4L2 CAPTURE format of the decoder, a framebuffer modifier of the video
+ * plane. Only the display engine reads it.
+ */
+#define LG1314_V4L2_PIX_FMT_NV12_8X4	v4l2_fourcc('L', 'G', 'T', '8')
+#define LG1314_FORMAT_MOD_NV12_8X4	((__u64)0x4c << 56 | 1)
 
 struct device_node;
 struct lg1314_vdec;
@@ -27,6 +36,8 @@ struct lg1314_vdec_vo_frame {
 	u32	width, height;		/* the buffer's size */
 	u32	stride;			/* both planes */
 	u32	crop_left, crop_right, crop_top, crop_bottom;
+	bool	tiled;			/* LG1314_FORMAT_MOD_NV12_8X4, a decoder
+					 * picture still held by userspace */
 };
 
 /* The decoder device behind @np, once its firmware is running. */
@@ -46,7 +57,8 @@ struct lg1314_vdec_vo *lg1314_vdec_vo_open(struct lg1314_vdec *v,
 /* Change the tick rate of a running output. */
 int lg1314_vdec_vo_set_rate(struct lg1314_vdec_vo *vo, unsigned int rate_num,
 			    unsigned int rate_den);
-/* Queue a frame; it goes on screen at the output's next tick. */
+/* Queue a frame; it goes on screen at the output's next tick. -ENOENT: a
+ * decoder picture (tiled) that is gone and must not be shown. */
 int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 			 const struct lg1314_vdec_vo_frame *f);
 /* No callbacks run once this returns; frames not yet released never are. */

@@ -235,7 +235,24 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 		.addr_y = f->addr_y,
 		.addr_cb = f->addr_c,
 	};
+	u32 c;
 	int ret = 0;
+
+	/* The firmware finds the picture's layout (map type) from its decoded
+	 * picture; without it, it shows the memory as raster. The second
+	 * part's address is the decoder's too (not NV12's for HEVC). */
+	if (f->tiled) {
+		/* the picture can't go away until the firmware has the frame */
+		lg1314_vdec_pictures_lock(vo->v, false);
+		w.decoder_priv = lg1314_vdec_picture_priv(vo->v, f->addr_y, &c);
+		/* gone (its decoder session ended, e.g. a seek): it would
+		 * show as raw memory */
+		if (!w.decoder_priv) {
+			lg1314_vdec_pictures_unlock(vo->v, false);
+			return -ENOENT;
+		}
+		w.addr_cb = c;
+	}
 
 	mutex_lock(&vo->lock);
 	if (memcmp(&fb, &vo->fb, sizeof(fb))) {
@@ -246,6 +263,8 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 	if (!ret)
 		ret = vo_ioctl(vo, VO_WRITE_PICTURE, 0, &w);
 	mutex_unlock(&vo->lock);
+	if (f->tiled)
+		lg1314_vdec_pictures_unlock(vo->v, false);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(lg1314_vdec_vo_write);

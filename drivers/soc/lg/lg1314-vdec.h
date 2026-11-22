@@ -50,12 +50,25 @@ void lg1314_vdec_dec_poll(struct lg1314_vdec_dec *dec, u32 handle, u32 mask);
 /*
  * The firmware wants a decoded-picture buffer of @size bytes: lend it a
  * decoder's output buffer if one fits. Returns its physical address and sets
- * *@cookie, or returns 0. Process context.
+ * *@cookie, or returns 0, with *@wait set if one will fit once userspace
+ * gives it back (the firmware asks again). Process context.
  */
 u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
-			      void **cookie);
+			      void **cookie, bool *wait);
 /* The firmware is done with a lent buffer. */
 void lg1314_vdec_dec_dpb_free(void *cookie);
+/*
+ * The firmware's key for the decoded picture at @addr (its luma) that
+ * userspace holds, or 0, and where its second part (chroma) starts. The
+ * video output needs both for a picture in the decoder's own layout.
+ */
+u32 lg1314_vdec_dec_picture_priv(struct lg1314_vdec_dec *dec, u32 addr,
+				 u32 *addr_c);
+u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c);
+/* Around looking a picture up and handing it to the video output (reader),
+ * or closing a decoder session, which frees its pictures (@closing). */
+void lg1314_vdec_pictures_lock(struct lg1314_vdec *v, bool closing);
+void lg1314_vdec_pictures_unlock(struct lg1314_vdec *v, bool closing);
 /* A decoded-picture buffer couldn't be had at all: the decoders stop. */
 void lg1314_vdec_dec_dpb_failed(struct lg1314_vdec_dec *dec);
 

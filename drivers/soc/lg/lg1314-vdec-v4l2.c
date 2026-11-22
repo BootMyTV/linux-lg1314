@@ -28,6 +28,7 @@
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/soc/lg/lg1314-vdec-vo.h>
 #include <linux/workqueue.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -55,6 +56,10 @@
 #define DEC_FW_PICS_MIN		10
 #define DEC_FW_PICS_MIN_UHD	13
 #define DEC_CPB_MARGIN		SZ_64K
+/* Frames queued in the firmware at most (stock keeps 5), and how often to
+ * look again while it is full. */
+#define DEC_FW_QUEUE		8
+#define DEC_FW_QUEUE_POLL_MS	2
 /*
  * The firmware tags each picture with its access unit's timestamp only once
  * it has seen input timestamps go backwards (presentation order); before
@@ -92,6 +97,23 @@ struct fw_es_data {
 	u32 pad;
 };
 static_assert(sizeof(struct fw_es_data) == 48);
+
+/* An access unit as a list of NAL units (each from its start code). */
+#define FW_MAX_NALS		64
+struct fw_es_nal_list {
+	u64 timestamp;
+	u64 uid;
+	u32 size;
+	u32 buf1_offset;
+	u32 buf1_size;
+	u32 buf2_offset;
+	u32 buf2_size;
+	s32 au_type;
+	s32 frame_count;
+	u32 nal_count;
+	u32 nal_size[FW_MAX_NALS];
+};
+static_assert(sizeof(struct fw_es_nal_list) == 304);
 
 /* What the firmware holds of the input: CPB bytes, access units queued. */
 struct fw_buffer_status {
@@ -146,6 +168,7 @@ enum { FW_PIC_I, FW_PIC_P, FW_PIC_B };
 #define FW_SET_NOTI_TAIL	_IO(FW_IOC_TYPE, 13)
 #define FW_GET_ES_BUFFER	_IOWR(FW_IOC_TYPE, 9, struct fw_es_data)
 #define FW_PUT_ES_BUFFER	_IOW(FW_IOC_TYPE, 10, struct fw_es_data)
+#define FW_PUT_ES_BUFFER_NAL_LIST _IOW(FW_IOC_TYPE, 68, struct fw_es_nal_list)
 #define FW_UNREF_DECODEBUFFER	_IOW(FW_IOC_TYPE, 17, u32)
 #define FW_SET_OUTPUT_MEMFMT	_IOW(FW_IOC_TYPE, 20, s32)
 #define FW_SET_CODEC		_IO(FW_IOC_TYPE, 23)
@@ -156,9 +179,11 @@ enum { FW_PIC_I, FW_PIC_P, FW_PIC_B };
 #define FW_EOS			_IO(FW_IOC_TYPE, 47)
 
 #define FW_CODEC_H264		0
+#define FW_CODEC_HEVC		16
 #define FW_SRC_BUFF		3
 #define FW_DST_BUFF		8
 #define FW_MEMFMT_RASTER	0
+#define FW_MEMFMT_TILED		1
 #define FW_AU_DATA		3
 
 /* Readiness bits the firmware reports. */
@@ -200,6 +225,8 @@ struct dec_slot {
 						 * end-of-stream marker) */
 	u32			shown_addr;	/* that picture, for the firmware */
 	u32			shown_gen;	/* in that session */
+	u32			shown_priv;	/* its firmware key (vdec_priv) */
+	u32			shown_c;	/* its chroma (or second part) */
 	struct dec_ctx		*ctx;		/* while vb */
 };
 
@@ -255,7 +282,14 @@ struct dec_ctx {
 	struct dec_slot		*slots[VB2_MAX_FRAME];
 
 	struct work_struct	noti_work;
+	struct delayed_work	retry_work;	/* input queue full */
+	bool			got_picture;	/* in this session */
 };
+
+static bool dec_is_hevc(const struct dec_ctx *ctx)
+{
+	return ctx->out_fmt.pixelformat == V4L2_PIX_FMT_HEVC;
+}
 
 static inline struct dec_ctx *file_to_ctx(struct file *file)
 {
@@ -342,6 +376,7 @@ struct h264_geometry {
 	u32 width, height;		/* coded */
 	struct v4l2_rect visible;
 	u32 dpb_frames;			/* pictures the decoder has to keep */
+	u32 bit_depth;			/* HEVC: luma */
 };
 
 static int h264_skip_hrd(struct h264_bits *b)
@@ -468,18 +503,96 @@ static int h264_parse_sps(const u8 *rbsp, size_t len, struct h264_geometry *g)
 	return 0;
 }
 
-/* Find the first SPS in an Annex-B access unit and parse it. */
-static int h264_find_sps(const u8 *data, size_t size, struct h264_geometry *g)
+/* ---- HEVC sequence parameter set ---- */
+
+/* profile_tier_level() with profilePresentFlag 1 */
+static int hevc_skip_ptl(struct h264_bits *b, u32 max_sub_layers_minus1)
+{
+	u32 v, profile = 0, level = 0;
+	unsigned int i;
+
+	/* general: profile space/tier/idc (8), compatibility flags (32), 4 flags,
+	 * 43 bits of constraints, 1 bit, level (8): 96 bits */
+	if (h264_bits(b, 32, &v) || h264_bits(b, 32, &v) || h264_bits(b, 32, &v))
+		return -EINVAL;
+	for (i = 0; i < max_sub_layers_minus1; i++) {
+		if (h264_bits(b, 2, &v))
+			return -EINVAL;
+		profile |= (v >> 1) << i;
+		level |= (v & 1) << i;
+	}
+	if (max_sub_layers_minus1)
+		for (i = max_sub_layers_minus1; i < 8; i++)
+			if (h264_bits(b, 2, &v))
+				return -EINVAL;
+	for (i = 0; i < max_sub_layers_minus1; i++) {
+		if (profile & BIT(i) && (h264_bits(b, 32, &v) ||
+					 h264_bits(b, 32, &v) || h264_bits(b, 24, &v)))
+			return -EINVAL;
+		if (level & BIT(i) && h264_bits(b, 8, &v))
+			return -EINVAL;
+	}
+	return 0;
+}
+
+static int hevc_parse_sps(const u8 *rbsp, size_t len, struct h264_geometry *g)
+{
+	struct h264_bits b = { .buf = rbsp, .len = len };
+	u32 v, subs, chroma, w, h, crop[4] = { 0 }, dpb = 1, cx, cy;
+	unsigned int i;
+
+	if (h264_bits(&b, 4, &v) || h264_bits(&b, 3, &subs) || h264_bits(&b, 1, &v) ||
+	    hevc_skip_ptl(&b, subs) || h264_ue(&b, &v) || h264_ue(&b, &chroma))
+		return -EINVAL;
+	if (chroma == 3 && h264_bits(&b, 1, &v))
+		return -EINVAL;
+	if (h264_ue(&b, &w) || h264_ue(&b, &h) || h264_bits(&b, 1, &v))
+		return -EINVAL;
+	if (v)		/* conformance window */
+		for (i = 0; i < 4; i++)
+			if (h264_ue(&b, &crop[i]))
+				return -EINVAL;
+	/* bit depths, log2_max_pic_order_cnt_lsb, sub_layer_ordering_info */
+	if (h264_ue(&b, &g->bit_depth) || h264_ue(&b, &v) || h264_ue(&b, &v) ||
+	    h264_bits(&b, 1, &v))
+		return -EINVAL;
+	for (i = v ? 0 : subs; i <= subs; i++) {
+		if (h264_ue(&b, &dpb) || h264_ue(&b, &v) || h264_ue(&b, &v))
+			return -EINVAL;
+		dpb++;
+	}
+	if (!w || !h || w > DEC_MAX_W || h > DEC_MAX_H)
+		return -EINVAL;
+	g->bit_depth += 8;
+	g->dpb_frames = min(dpb, 16u);
+	g->width = w;
+	g->height = h;
+	cx = chroma == 1 || chroma == 2 ? 2 : 1;
+	cy = chroma == 1 ? 2 : 1;
+	if ((crop[0] + crop[1]) * cx >= w || (crop[2] + crop[3]) * cy >= h)
+		return -EINVAL;
+	g->visible.left = crop[0] * cx;
+	g->visible.top = crop[2] * cy;
+	g->visible.width = w - (crop[0] + crop[1]) * cx;
+	g->visible.height = h - (crop[2] + crop[3]) * cy;
+	return 0;
+}
+
+/* Find the first SPS in an Annex-B access unit (H.264, or HEVC) and parse
+ * it. */
+static int dec_find_sps(const u8 *data, size_t size, bool hevc,
+			struct h264_geometry *g)
 {
 	size_t i, start, end, n;
 	u8 *rbsp;
 	int ret;
 
-	for (i = 0; i + 3 < size; i++) {
-		if (data[i] || data[i + 1] || data[i + 2] != 1 ||
-		    (data[i + 3] & 0x1f) != 7)
+	for (i = 0; i + 4 < size; i++) {
+		if (data[i] || data[i + 1] || data[i + 2] != 1)
 			continue;
-		start = i + 4;
+		if (hevc ? (data[i + 3] >> 1 & 0x3f) != 33 : (data[i + 3] & 0x1f) != 7)
+			continue;
+		start = i + (hevc ? 5 : 4);
 		for (end = start; end + 2 < size; end++)
 			if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
 				break;
@@ -494,7 +607,7 @@ static int h264_find_sps(const u8 *data, size_t size, struct h264_geometry *g)
 				continue;
 			rbsp[n++] = data[i];
 		}
-		ret = h264_parse_sps(rbsp, n, g);
+		ret = hevc ? hevc_parse_sps(rbsp, n, g) : h264_parse_sps(rbsp, n, g);
 		kfree(rbsp);
 		return ret;
 	}
@@ -546,10 +659,12 @@ static void dec_session_close(struct dec_ctx *ctx)
 	if (ctx->cpb)
 		memunmap(ctx->cpb);
 	ctx->noti = ctx->cpb = NULL;
+	lg1314_vdec_pictures_lock(ctx->dec->v, true);
 	lg1314_vdec_call(ctx->dec->v, VDEC_CALL_VDEC_CLOSE, ctx->handle, NULL, 0,
 			 0, &result);
 	dev_dbg(ctx->dec->dev, "ctx %p: session %#x closed\n", ctx, ctx->handle);
-	ctx->handle = 0;
+	WRITE_ONCE(ctx->handle, 0);
+	lg1314_vdec_pictures_unlock(ctx->dec->v, true);
 }
 
 /* Map a firmware ring (physical address) for the CPU. */
@@ -564,9 +679,13 @@ static int dec_session_open(struct dec_ctx *ctx)
 {
 	struct lg1314_vdec *v = ctx->dec->v;
 	struct fw_buffer_info info;
-	s32 memfmt = FW_MEMFMT_RASTER;
+	s32 memfmt = ctx->cap_fmt.pixelformat == LG1314_V4L2_PIX_FMT_NV12_8X4 ?
+		     FW_MEMFMT_TILED : FW_MEMFMT_RASTER;
 	int ret, handle;
 
+	/* A new session before it has a handle: pictures of the last one
+	 * are no longer current from here on (the handle may be the same). */
+	ctx->gen++;
 	ret = lg1314_vdec_call(v, VDEC_CALL_VDEC_OPEN, 0, NULL, 0, 0, &handle);
 	if (ret)
 		return ret;
@@ -574,7 +693,8 @@ static int dec_session_open(struct dec_ctx *ctx)
 		return -EBUSY;
 	ctx->handle = handle;
 
-	ret = dec_fw_ioctl(ctx, FW_SET_CODEC, FW_CODEC_H264, NULL);
+	ret = dec_fw_ioctl(ctx, FW_SET_CODEC, dec_is_hevc(ctx) ? FW_CODEC_HEVC :
+							     FW_CODEC_H264, NULL);
 	if (!ret)
 		ret = dec_fw_ioctl(ctx, FW_SET_INPUT_DEVICE, FW_SRC_BUFF, NULL);
 	if (!ret)
@@ -603,9 +723,9 @@ static int dec_session_open(struct dec_ctx *ctx)
 	}
 
 	dev_dbg(ctx->dec->dev, "ctx %p: session %#x open\n", ctx, ctx->handle);
-	ctx->gen++;
 	ctx->cpb_full = false;
 	ctx->draining = ctx->eos_sent = ctx->eos_reported = false;
+	ctx->got_picture = false;
 	return 0;
 
 fail:
@@ -672,22 +792,46 @@ static int dec_copy_frame(struct dec_ctx *ctx, const struct fw_decoded *d,
 /*
  * CAPTURE is the firmware's picture layout for a coded size (whole
  * macroblocks): NV12 with the chroma right after the luma, then 64 bytes of
- * motion data per macroblock, in whole pages.
+ * motion data per macroblock, in whole pages. Raster, or the decoder's own
+ * 8x4 tiles (same sizes; only the display engine reads those), as chosen
+ * before decoding starts.
  */
 static void dec_set_cap_fmt(struct dec_ctx *ctx, u32 width, u32 height)
 {
 	struct v4l2_pix_format_mplane *f = &ctx->cap_fmt;
+	u32 extra;
 
-	width = ALIGN(width, 16);
-	height = ALIGN(height, 16);
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	if (dec_is_hevc(ctx)) {
+		/*
+		 * HEVC: only the decoder's own (compressed) layout, which the
+		 * display engine reads; P and B pictures don't decode into
+		 * raster. Measured: a table of 64 KiB per 2048x512, then 16 KiB
+		 * per 64x128 (8 and 10 bits alike), then 256 bytes per 64x64.
+		 */
+		u32 w64 = DIV_ROUND_UP(width, 64);
+
+		width = ALIGN(width, 8);
+		height = ALIGN(height, 8);
+		f->pixelformat = LG1314_V4L2_PIX_FMT_NV12_8X4;
+		f->plane_fmt[0].bytesperline = w64 * 64;
+		f->plane_fmt[0].sizeimage = ALIGN(
+			DIV_ROUND_UP(width, 2048) * DIV_ROUND_UP(height, 512) * SZ_64K +
+			w64 * DIV_ROUND_UP(height, 128) * SZ_16K +
+			w64 * DIV_ROUND_UP(height, 64) * 256, SZ_4K);
+	} else {
+		width = ALIGN(width, 16);
+		height = ALIGN(height, 16);
+		extra = (width / 16) * (height / 16) * 64;
+		if (f->pixelformat != LG1314_V4L2_PIX_FMT_NV12_8X4)
+			f->pixelformat = V4L2_PIX_FMT_NV12;
+		f->plane_fmt[0].bytesperline = width;
+		f->plane_fmt[0].sizeimage = ALIGN(width * height * 3 / 2 + extra,
+						  SZ_4K);
+	}
 	f->width = width;
 	f->height = height;
 	f->field = V4L2_FIELD_NONE;
 	f->num_planes = 1;
-	f->plane_fmt[0].bytesperline = width;
-	f->plane_fmt[0].sizeimage = ALIGN(width * height * 3 / 2 +
-					  (width / 16) * (height / 16) * 64, SZ_4K);
 	f->colorspace = ctx->out_fmt.colorspace;
 	f->xfer_func = ctx->out_fmt.xfer_func;
 	f->ycbcr_enc = ctx->out_fmt.ycbcr_enc;
@@ -764,7 +908,7 @@ static u64 dec_picture_timestamp(struct dec_ctx *ctx, const struct fw_decoded *d
  */
 static void dec_fail(struct dec_ctx *ctx, const char *why)
 {
-	dev_warn(ctx->dec->dev, "decoder stopped: %s\n", why);
+	dev_warn_ratelimited(ctx->dec->dev, "decoder stopped: %s\n", why);
 	vb2_queue_error(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx));
 }
 
@@ -851,13 +995,19 @@ static void dec_release_returned(struct dec_ctx *ctx)
 	}
 	spin_unlock(&dec_dpb_lock);
 
+	if (!n)
+		return;
+	/* not while a frame with one of them goes to the video output */
+	lg1314_vdec_pictures_lock(ctx->dec->v, true);
 	for (i = 0; i < n && ctx->handle; i++)
 		dec_fw_ioctl(ctx, FW_UNREF_DECODEBUFFER, 0, &addr[i]);
+	lg1314_vdec_pictures_unlock(ctx->dec->v, true);
 }
 
 u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
-			      void **cookie)
+			      void **cookie, bool *wait)
 {
+	bool held_only = false;
 	struct dec_slot *pick = NULL;
 	struct dec_ctx *ctx;
 	unsigned long flags;
@@ -888,7 +1038,9 @@ u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
 			if (!sl || sl->fw)
 				continue;
 			unlent++;
-			if (sl->size < size || sl->size - size > size / 4 ||
+			/* (near) exactly the picture size: HEVC's working
+			 * buffers come from the same requests */
+			if (sl->size < size || sl->size - size >= SZ_64K ||
 			    (sl->phys & (max(align, 1u) - 1)))
 				continue;
 			if (sl->user) {
@@ -898,9 +1050,16 @@ u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
 				fit = sl;
 			}
 		}
+		/* HEVC has no spare buffers: one userspace holds (likely on
+		 * screen, from before a seek) would be decoded into while
+		 * shown, and waited for. Rather wait for one to come back. */
+		if (!fit && fit_held && dec_is_hevc(ctx)) {
+			held_only = true;
+			continue;
+		}
 		if (!fit)
 			fit = fit_held;
-		if (!fit || unlent <= DEC_CAP_SPARE)
+		if (!fit || unlent <= (dec_is_hevc(ctx) ? 0 : DEC_CAP_SPARE))
 			continue;
 		if (pick)
 			several = true;
@@ -911,10 +1070,43 @@ u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
 		*cookie = pick;
 	} else {
 		pick = NULL;
+		*wait = held_only;
 	}
 	spin_unlock(&dec_dpb_lock);
 	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
 	return pick ? pick->phys : 0;
+}
+
+u32 lg1314_vdec_dec_picture_priv(struct lg1314_vdec_dec *dec, u32 addr,
+				 u32 *addr_c)
+{
+	struct dec_ctx *ctx;
+	unsigned long flags;
+	unsigned int i;
+	u32 priv = 0;
+
+	if (!dec)
+		return 0;
+	spin_lock_irqsave(&dec->ctxs_lock, flags);
+	spin_lock(&dec_dpb_lock);
+	list_for_each_entry(ctx, &dec->ctxs, node) {
+		for (i = 0; i < ARRAY_SIZE(ctx->slots) && !priv; i++) {
+			struct dec_slot *sl = ctx->slots[i];
+
+			/* only while the firmware still has the picture: its
+			 * session is the open one */
+			if (sl && sl->shown && !sl->back && sl->shown_addr == addr &&
+			    sl->shown_gen == ctx->gen && READ_ONCE(ctx->handle)) {
+				priv = sl->shown_priv;
+				*addr_c = sl->shown_c;
+			}
+		}
+		if (priv)
+			break;
+	}
+	spin_unlock(&dec_dpb_lock);
+	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
+	return priv;
 }
 
 void lg1314_vdec_dec_dpb_failed(struct lg1314_vdec_dec *dec)
@@ -999,6 +1191,8 @@ static void dec_deliver(struct dec_ctx *ctx)
 				ctx->slots[index]->back = false;
 				ctx->slots[index]->shown_addr = f->d.addr_y;
 				ctx->slots[index]->shown_gen = ctx->gen;
+				ctx->slots[index]->shown_priv = f->d.vdec_priv;
+				ctx->slots[index]->shown_c = f->d.addr_cb;
 			}
 			spin_unlock(&dec_dpb_lock);
 			vb2_set_plane_payload(&dst->vb2_buf, 0,
@@ -1091,6 +1285,7 @@ static bool dec_drain_noti(struct dec_ctx *ctx)
 				if (f) {
 					dec_noti_read(ctx, tail + 8, &f->d, len);
 					if (f->d.addr_y) {
+						ctx->got_picture = true;
 						list_add_tail(&f->list, &ctx->pending);
 						ctx->npending++;
 					} else {
@@ -1131,6 +1326,18 @@ static void dec_noti_work(struct work_struct *work)
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
 }
 
+/* Look at the firmware's input queue again. */
+static void dec_retry_work(struct work_struct *work)
+{
+	struct dec_ctx *ctx = container_of(to_delayed_work(work), struct dec_ctx,
+					   retry_work);
+
+	mutex_lock(&ctx->fw_lock);
+	ctx->cpb_full = false;
+	mutex_unlock(&ctx->fw_lock);
+	v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
+}
+
 void lg1314_vdec_dec_poll(struct lg1314_vdec_dec *dec, u32 handle, u32 mask)
 {
 	struct dec_ctx *ctx;
@@ -1159,24 +1366,120 @@ static u32 dec_cpb_free(struct dec_ctx *ctx)
 	return info.size - used;
 }
 
+/* Frames the firmware holds that it hasn't decoded (or skipped) yet; 0 if
+ * it can't tell. fw_lock held. */
+static u32 dec_fw_queued(struct dec_ctx *ctx)
+{
+	struct fw_buffer_status st;
+
+	return dec_fw_ioctl(ctx, FW_GET_BUFFER_STATUS, 0, &st) ? 0 : st.frame_count;
+}
+
 /* Copy one access unit into the CPB and hand it to the firmware. fw_lock held. */
+/*
+ * HEVC: whether an access unit has NAL units that aren't the base layer's
+ * (Dolby Vision's RPU and enhancement layer: types 62 and 63, or a layer id
+ * above 0); if so, a copy without them in *@out (*@out_size bytes).
+ */
+static int dec_hevc_base_layer(const u8 *data, u32 size, u8 **out, u32 *out_size)
+{
+	u32 i, start, end, n = 0;
+	bool other = false;
+	u8 *buf = NULL;
+
+	for (int pass = 0; pass < 2; pass++) {
+		for (i = 0; i + 4 < size; ) {
+			bool skip;
+
+			if (data[i] || data[i + 1] || data[i + 2] != 1) {
+				i++;
+				continue;
+			}
+			/* a start code, its leading zero byte if 4 bytes long */
+			start = i && !data[i - 1] ? i - 1 : i;
+			for (end = i + 3; end + 2 < size; end++)
+				if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
+					break;
+			if (end + 2 >= size)
+				end = size;
+			skip = (data[i + 3] >> 1 & 0x3f) >= 62 ||
+			       ((data[i + 3] & 1) << 5 | data[i + 4] >> 3);
+			if (!pass) {
+				other |= skip;
+			} else if (!skip) {
+				memcpy(buf + n, data + start, end - start);
+				n += end - start;
+			}
+			i = end;
+		}
+		if (!other)
+			return 0;
+		if (!pass) {
+			buf = kvmalloc(size, GFP_KERNEL);
+			if (!buf)
+				return -ENOMEM;
+		}
+	}
+	*out = buf;
+	*out_size = n;
+	return 1;
+}
+
+/*
+ * The sizes of an Annex-B access unit's NAL units, each from its start code
+ * to the next one (the first from the start); past FW_MAX_NALS the rest goes
+ * with the last. Returns how many.
+ */
+static u32 dec_nal_sizes(const u8 *data, u32 size, u32 *sizes)
+{
+	u32 i, n = 0, start = 0;
+
+	for (i = 3; i + 3 < size; i++) {
+		if (data[i] || data[i + 1] || data[i + 2] != 1)
+			continue;
+		/* a new NAL unit at i (or i - 1 for a 4-byte start code) */
+		if (i - (data[i - 1] ? 0 : 1) > start && n < FW_MAX_NALS - 1) {
+			u32 at = i - (data[i - 1] ? 0 : 1);
+
+			sizes[n++] = at - start;
+			start = at;
+		}
+		i += 2;
+	}
+	sizes[n++] = size - start;
+	return n;
+}
+
 static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 {
 	const void *data = vb2_plane_vaddr(&src->vb2_buf, 0);
 	u32 size = vb2_get_plane_payload(&src->vb2_buf, 0);
-	struct fw_es_data es = { .size = size };
+	struct fw_es_data es;
+	u8 *copy = NULL;
 	int ret;
+
+	/* the decoder decodes the base layer, and garbles it if handed more */
+	if (dec_is_hevc(ctx)) {
+		ret = dec_hevc_base_layer(data, size, &copy, &size);
+		if (ret < 0)
+			return ret;
+		if (copy)
+			data = copy;
+	}
+	es = (struct fw_es_data){ .size = size };
 
 	dev_dbg(ctx->dec->dev, "ctx %p: feed %u bytes, starts %*ph\n",
 		ctx, size, 5, data);
 
 	ret = dec_fw_ioctl(ctx, FW_GET_ES_BUFFER, 0, &es);
-	if (ret)
+	if (!ret && (es.buf1_offset + es.buf1_size > ctx->cpb_size ||
+		     es.buf2_offset + es.buf2_size > ctx->cpb_size ||
+		     es.buf1_size + es.buf2_size < size))
+		ret = -EIO;
+	if (ret) {
+		kvfree(copy);
 		return ret;
-	if (es.buf1_offset + es.buf1_size > ctx->cpb_size ||
-	    es.buf2_offset + es.buf2_size > ctx->cpb_size ||
-	    es.buf1_size + es.buf2_size < size)
-		return -EIO;
+	}
 	memcpy(ctx->cpb + es.buf1_offset, data, min(size, es.buf1_size));
 	if (size > es.buf1_size)
 		memcpy(ctx->cpb + es.buf2_offset, data + es.buf1_size,
@@ -1188,7 +1491,33 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	ctx->ts[es.uid % DEC_TS_RING] = src->vb2_buf.timestamp;
 	es.size = size;
 	es.au_type = FW_AU_DATA;
-	es.frame_count = 1;
+	/* a running frame number: the firmware counts what it holds with it */
+	es.frame_count = (es.uid + 1) & S32_MAX;
+	if (dec_is_hevc(ctx)) {
+		/* HEVC's decoder finds slices only as separate NAL units: with
+		 * a picture's slices in one piece, it decodes the first */
+		struct fw_es_nal_list *nl = kzalloc(sizeof(*nl), GFP_KERNEL);
+
+		if (!nl) {
+			kvfree(copy);
+			return -ENOMEM;
+		}
+		nl->timestamp = es.timestamp;
+		nl->uid = es.uid;
+		nl->size = es.size;
+		nl->buf1_offset = es.buf1_offset;
+		nl->buf1_size = es.buf1_size;
+		nl->buf2_offset = es.buf2_offset;
+		nl->buf2_size = es.buf2_size;
+		nl->au_type = es.au_type;
+		nl->frame_count = es.frame_count;
+		nl->nal_count = dec_nal_sizes(data, size, nl->nal_size);
+		ret = dec_fw_ioctl(ctx, FW_PUT_ES_BUFFER_NAL_LIST, 0, nl);
+		kfree(nl);
+		kvfree(copy);
+		return ret;
+	}
+	kvfree(copy);
 	return dec_fw_ioctl(ctx, FW_PUT_ES_BUFFER, 0, &es);
 }
 
@@ -1203,14 +1532,18 @@ static bool dec_wait_geometry(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 
 	if (ctx->src_change)
 		return true;
-	if (h264_find_sps(vb2_plane_vaddr(&src->vb2_buf, 0),
-			  vb2_get_plane_payload(&src->vb2_buf, 0), &g) ||
+	if (dec_find_sps(vb2_plane_vaddr(&src->vb2_buf, 0),
+			 vb2_get_plane_payload(&src->vb2_buf, 0), dec_is_hevc(ctx), &g) ||
 	    dec_geometry_is(ctx, g.width, g.height, &g.visible))
 		return false;
 	/* Enough CAPTURE buffers for all of the firmware's pictures, when
 	 * they are to be lent. */
 	ctx->cap_min = DEC_CAP_MIN_BUFS;
-	if (READ_ONCE(dec_zerocopy))
+	if (dec_is_hevc(ctx))
+		/* allocated as the decoder needs them, up to this; no spares:
+		 * a copied picture of the decoder's layout can't be shown */
+		ctx->cap_min = g.dpb_frames + DEC_FW_PICS_EXTRA + 1;
+	else if (READ_ONCE(dec_zerocopy))
 		ctx->cap_min = max(g.dpb_frames + DEC_FW_PICS_EXTRA,
 				   g.width * g.height > 1920 * 1088 ?
 				   DEC_FW_PICS_MIN_UHD : DEC_FW_PICS_MIN) +
@@ -1237,8 +1570,19 @@ static void dec_device_run(void *priv)
 	if (size) {
 		if (dec_wait_geometry(ctx, src))
 			goto out;
-		/* Only the CPB's space limits input: the firmware doesn't
-		 * report access units it skips, so they can't be counted. */
+		/*
+		 * A short input queue in the firmware, as stock keeps. A new
+		 * session decodes only I pictures until one is back, and its
+		 * feeder skips a deep queue of other pictures before that: one
+		 * access unit at a time until the first picture. The firmware
+		 * doesn't report pictures it skips, so its own count is asked.
+		 */
+		if (dec_fw_queued(ctx) >= (ctx->got_picture ? DEC_FW_QUEUE : 1)) {
+			ctx->cpb_full = true;
+			schedule_delayed_work(&ctx->retry_work,
+					      msecs_to_jiffies(DEC_FW_QUEUE_POLL_MS));
+			goto out;
+		}
 		if (dec_cpb_free(ctx) < size + DEC_CPB_MARGIN) {
 			ctx->cpb_full = true;
 			goto out;
@@ -1291,8 +1635,10 @@ static int dec_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 		       -EINVAL : 0;
 	*nplanes = 1;
 	sizes[0] = f->plane_fmt[0].sizeimage;
+	/* HEVC's pictures at 4K leave room for no more than it uses */
 	if (V4L2_TYPE_IS_CAPTURE(vq->type))
-		*nbuffers = max(*nbuffers, ctx->cap_min);
+		*nbuffers = dec_is_hevc(ctx) ? ctx->cap_min :
+			    max(*nbuffers, ctx->cap_min);
 	return 0;
 }
 
@@ -1474,6 +1820,7 @@ static void dec_stop_streaming(struct vb2_queue *vq)
 	struct dec_ctx *ctx = vb2_get_drv_priv(vq);
 
 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+		cancel_delayed_work_sync(&ctx->retry_work);
 		cancel_work_sync(&ctx->noti_work);
 		mutex_lock(&ctx->fw_lock);
 		dec_session_close(ctx);
@@ -1536,21 +1883,31 @@ static int dec_querycap(struct file *file, void *priv, struct v4l2_capability *c
 
 static int dec_enum_fmt(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index)
-		return -EINVAL;
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
-		f->pixelformat = V4L2_PIX_FMT_H264;
+		if (f->index > 1)
+			return -EINVAL;
+		f->pixelformat = f->index ? V4L2_PIX_FMT_HEVC : V4L2_PIX_FMT_H264;
 		f->flags = V4L2_FMT_FLAG_COMPRESSED | V4L2_FMT_FLAG_DYN_RESOLUTION;
-	} else {
-		f->pixelformat = V4L2_PIX_FMT_NV12;
+		return 0;
 	}
-	return 0;
+	switch (f->index + dec_is_hevc(file_to_ctx(file))) {
+	case 0:
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+		return 0;
+	case 1:
+		f->pixelformat = LG1314_V4L2_PIX_FMT_NV12_8X4;
+		strscpy(f->description, "LG1314 decoder layout",
+			sizeof(f->description));
+		return 0;
+	}
+	return -EINVAL;
 }
 
 static int dec_enum_framesizes(struct file *file, void *priv,
 			       struct v4l2_frmsizeenum *fs)
 {
-	if (fs->index || fs->pixel_format != V4L2_PIX_FMT_H264)
+	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_H264 &&
+			  fs->pixel_format != V4L2_PIX_FMT_HEVC))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -1569,7 +1926,8 @@ static int dec_g_fmt(struct file *file, void *priv, struct v4l2_format *f)
 
 static void dec_adjust_out_fmt(struct v4l2_pix_format_mplane *f)
 {
-	f->pixelformat = V4L2_PIX_FMT_H264;
+	if (f->pixelformat != V4L2_PIX_FMT_HEVC)
+		f->pixelformat = V4L2_PIX_FMT_H264;
 	f->width = clamp(f->width, (u32)DEC_MIN_W, (u32)DEC_MAX_W);
 	f->height = clamp(f->height, (u32)DEC_MIN_H, (u32)DEC_MAX_H);
 	f->field = V4L2_FIELD_NONE;
@@ -1584,10 +1942,17 @@ static int dec_try_fmt(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct dec_ctx *ctx = file_to_ctx(file);
 
-	if (V4L2_TYPE_IS_OUTPUT(f->type))
+	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
 		dec_adjust_out_fmt(&f->fmt.pix_mp);
-	else
-		f->fmt.pix_mp = ctx->cap_fmt;	/* fixed by the stream */
+	} else {
+		bool tiled = f->fmt.pix_mp.pixelformat == LG1314_V4L2_PIX_FMT_NV12_8X4;
+
+		/* The sizes are fixed by the stream, the layout can be chosen. */
+		f->fmt.pix_mp = ctx->cap_fmt;
+		if (!dec_is_hevc(ctx))
+			f->fmt.pix_mp.pixelformat = tiled ? LG1314_V4L2_PIX_FMT_NV12_8X4 :
+							    V4L2_PIX_FMT_NV12;
+	}
 	return 0;
 }
 
@@ -1599,6 +1964,17 @@ static int dec_s_fmt(struct file *file, void *priv, struct v4l2_format *f)
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 	dec_try_fmt(file, priv, f);
+	if (!V4L2_TYPE_IS_OUTPUT(f->type) &&
+	    f->fmt.pix_mp.pixelformat != ctx->cap_fmt.pixelformat) {
+		/* The firmware's output layout is set when its session opens. */
+		mutex_lock(&ctx->fw_lock);
+		if (ctx->handle) {
+			mutex_unlock(&ctx->fw_lock);
+			return -EBUSY;
+		}
+		ctx->cap_fmt.pixelformat = f->fmt.pix_mp.pixelformat;
+		mutex_unlock(&ctx->fw_lock);
+	}
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
 		ctx->out_fmt = f->fmt.pix_mp;
 		if (!ctx->have_geometry) {
@@ -1737,6 +2113,7 @@ static int dec_open(struct file *file)
 	ctx->wait_index = -1;
 	ctx->bufstat_ret = 1;	/* not fetched */
 	INIT_WORK(&ctx->noti_work, dec_noti_work);
+	INIT_DELAYED_WORK(&ctx->retry_work, dec_retry_work);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 	file->private_data = &ctx->fh;
 
@@ -1787,6 +2164,7 @@ static int dec_release(struct file *file)
 	mutex_lock(&dec->lock);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
 	mutex_unlock(&dec->lock);
+	cancel_delayed_work_sync(&ctx->retry_work);
 	cancel_work_sync(&ctx->noti_work);
 	mutex_lock(&ctx->fw_lock);
 	dec_session_close(ctx);

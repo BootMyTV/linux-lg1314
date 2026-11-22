@@ -256,6 +256,10 @@ struct lg1314_vdec {
 	struct gen_pool		*hma_cpb;
 	struct list_head	hma_allocs;	/* live allocations, for frees */
 	struct mutex		hma_lock;
+	/* A decoded picture's key goes to the video output only while its
+	 * decoder session is open: writers of such frames read, closing a
+	 * session writes. */
+	struct rw_semaphore	pictures_lock;
 
 	struct lg1314_vdec_pt	*pt;		/* raw decoder interface, if built */
 	struct lg1314_vdec_dec	*dec;		/* V4L2 decoder */
@@ -602,8 +606,10 @@ static unsigned long vdec_hma_alloc_dpb(struct lg1314_vdec *v,
 {
 	dma_addr_t dma;
 
+	/* The firmware retries a failed request at once and for ever: no
+	 * allocator report each time (it floods the console). */
 	a->vaddr = dma_alloc_noncoherent(v->dev, max(size, align), &dma,
-					 DMA_FROM_DEVICE, GFP_KERNEL);
+					 DMA_FROM_DEVICE, GFP_KERNEL | __GFP_NOWARN);
 	if (!a->vaddr)
 		return 0;
 	if (align && (dma & (align - 1))) {
@@ -629,6 +635,27 @@ static void vdec_hma_free_one(struct lg1314_vdec *v, struct vdec_hma_alloc *a)
 	kfree(a);
 }
 
+void lg1314_vdec_pictures_lock(struct lg1314_vdec *v, bool closing)
+{
+	if (closing)
+		down_write(&v->pictures_lock);
+	else
+		down_read(&v->pictures_lock);
+}
+
+void lg1314_vdec_pictures_unlock(struct lg1314_vdec *v, bool closing)
+{
+	if (closing)
+		up_write(&v->pictures_lock);
+	else
+		up_read(&v->pictures_lock);
+}
+
+u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c)
+{
+	return lg1314_vdec_dec_picture_priv(v->dec, addr, addr_c);
+}
+
 static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 			  u32 size, u32 align, const char *name)
 {
@@ -645,19 +672,29 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 		phys = gen_pool_alloc_algo(pool, size, gen_pool_first_fit_align, &data);
 	} else {
 		/* A decoded-picture buffer goes straight to userspace when a
-		 * decoder has an output buffer to lend for it. */
+		 * decoder has an output buffer to lend for it (H.264: gx_dpb;
+		 * HEVC: ipt17, along with its working buffers, which don't fit
+		 * one). */
+		bool wait = false;
+
 		phys = 0;
-		if (!strcmp(name, "gx_dpb"))
+		if (!strcmp(name, "gx_dpb") || !strcmp(name, "ipt17"))
 			phys = lg1314_vdec_dec_dpb_alloc(v->dec, size, align,
-							 &a->lent);
+							 &a->lent, &wait);
+		if (wait) {
+			/* The firmware asks again at once: not too often. */
+			kfree(a);
+			msleep(5);
+			return 0;
+		}
 		if (!phys) {
 			phys = vdec_hma_alloc_dpb(v, a, size, align);
 			size = max(size, align);
 		}
 	}
 	if (!phys) {
-		dev_warn(v->dev, "hma: out of memory for %u bytes (align %#x)\n",
-			 size, align);
+		dev_warn_ratelimited(v->dev, "hma: out of memory for %u bytes (align %#x)\n",
+				     size, align);
 		kfree(a);
 		if (!pool && !strcmp(name, "gx_dpb"))
 			lg1314_vdec_dec_dpb_failed(v->dec);
@@ -1411,6 +1448,7 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&v->waiters);
 	INIT_LIST_HEAD(&v->hma_allocs);
 	mutex_init(&v->hma_lock);
+	init_rwsem(&v->pictures_lock);
 
 	v->rc = devm_ioremap(dev, VDEC_MCU_RC_PHYS, VDEC_MCU_RC_SIZE);
 	v->ipc = devm_ioremap(dev, VDEC_MCU_IPC_PHYS, VDEC_MCU_IPC_SIZE);
