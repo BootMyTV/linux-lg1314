@@ -55,6 +55,9 @@
 #define DEC_FW_PICS_EXTRA	6
 #define DEC_FW_PICS_MIN		10
 #define DEC_FW_PICS_MIN_UHD	13
+/* HEVC asks for pictures as it runs out, beyond its DPB while the player
+ * holds some: 12 with a DPB of 3 (stock too). */
+#define DEC_HEVC_PICS_MIN	12
 #define DEC_CPB_MARGIN		SZ_64K
 /* Frames queued in the firmware at most (stock keeps 5), and how often to
  * look again while it is full. */
@@ -1198,6 +1201,11 @@ static void dec_deliver(struct dec_ctx *ctx)
 			vb2_set_plane_payload(&dst->vb2_buf, 0,
 					      ctx->cap_fmt.plane_fmt[0].sizeimage);
 			ok = true;
+		} else if (dec_is_hevc(ctx)) {
+			/* Its own buffer (all CAPTURE ones were lent): no spare
+			 * to copy to, and pictures behind it would wait forever. */
+			dec_fail(ctx, "picture in a buffer not lent (too few CAPTURE buffers)");
+			return;
 		} else {
 			dst = dec_take_dst(ctx, false);
 			if (!dst)
@@ -1542,7 +1550,8 @@ static bool dec_wait_geometry(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	if (dec_is_hevc(ctx))
 		/* allocated as the decoder needs them, up to this; no spares:
 		 * a copied picture of the decoder's layout can't be shown */
-		ctx->cap_min = g.dpb_frames + DEC_FW_PICS_EXTRA + 1;
+		ctx->cap_min = max(g.dpb_frames + DEC_FW_PICS_EXTRA + 1,
+				   DEC_HEVC_PICS_MIN);
 	else if (READ_ONCE(dec_zerocopy))
 		ctx->cap_min = max(g.dpb_frames + DEC_FW_PICS_EXTRA,
 				   g.width * g.height > 1920 * 1088 ?
