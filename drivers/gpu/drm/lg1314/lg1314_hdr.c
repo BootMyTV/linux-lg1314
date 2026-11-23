@@ -296,11 +296,17 @@ static void lg1314_hdr_apply(struct lg1314_drm *lg,
 		lg->hdr.hdr10 = hdr10;
 	}
 	hdr_regs(lg, hdr10);
-	if (hdr10)
+	if (hdr10) {
+		lg->hdr.mdl_min = md->min_display_mastering_luminance;
+		lg->hdr.mdl_max = md->max_display_mastering_luminance;
+		lg->hdr.max_cll = md->max_cll;
+		lg->hdr.max_fall = md->max_fall;
 		dev_info(lg->dev, "HDR10: mastering %u nit, MaxCLL %u: tone map for %u nit\n",
 			 md->max_display_mastering_luminance, md->max_cll, nits);
-	else
+	} else {
 		dev_info(lg->dev, "SDR\n");
+	}
+	lg1314_status_update(lg);
 }
 
 /*

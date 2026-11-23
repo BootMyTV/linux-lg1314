@@ -253,6 +253,8 @@ static int video_atomic_check(struct drm_plane *plane,
 			return -EINVAL;
 		}
 		v->vdec = vdec;
+		/* its Dolby Vision metadata, to prepare scenes ahead */
+		lg1314_dovi_attach(lg, vdec);
 	}
 
 	/* One stride for both planes, both inside the memory the display
@@ -328,7 +330,7 @@ static void video_atomic_update(struct drm_plane *plane,
 
 	if (!v->vo) {
 		/* the output's mode is set before its first picture */
-		v->dovi_profile = dovi > 0 && !lg1314_dovi_start(lg) ? dovi : 0;
+		v->dovi_profile = dovi > 0 && !lg1314_dovi_start(lg, dovi) ? dovi : 0;
 		v->dovi_last_addr = 0;
 		v->dovi_pic_valid = false;
 		v->dovi_session = session;
@@ -492,6 +494,7 @@ void lg1314_video_fini(struct lg1314_drm *lg)
 	if (!v->vdec_np)
 		return;
 	cancel_delayed_work_sync(&v->calib_work);
+	lg1314_dovi_detach(lg);
 	if (v->vdec)
 		lg1314_vdec_put(v->vdec);
 	of_node_put(v->vdec_np);

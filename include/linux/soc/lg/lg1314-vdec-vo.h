@@ -78,4 +78,14 @@ void lg1314_vdec_vo_close(struct lg1314_vdec_vo *vo);
 int lg1314_vdec_picture_dovi(struct lg1314_vdec *v, u32 addr_y, u64 *timestamp,
 			     u32 *session, struct lg1314_dovi_pic *pic);
 
+/*
+ * Dolby Vision DM metadata as the decoder parses it, one call per access
+ * unit fed (in stream order, ahead of its picture's display): for display
+ * management to prepare. Called with a spinlock held: must not sleep. Once
+ * the listener is replaced (@fn NULL: none), the old one isn't called again.
+ */
+typedef void (*lg1314_vdec_dovi_fn)(void *data, const struct lg1314_dovi_dm *dm);
+void lg1314_vdec_set_dovi_listener(struct lg1314_vdec *v, lg1314_vdec_dovi_fn fn,
+				   void *data);
+
 #endif

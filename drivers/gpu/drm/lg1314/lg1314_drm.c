@@ -739,6 +739,10 @@ static int lg1314_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_video;
 
+	ret = lg1314_status_init(lg);
+	if (ret)
+		goto err_video;
+
 	ret = drm_dev_register(&lg->drm, 0);
 	if (ret)
 		goto err_video;
@@ -748,7 +752,6 @@ static int lg1314_probe(struct platform_device *pdev)
 	return 0;
 
 err_video:
-	lg1314_dovi_fini(lg);
 	lg1314_video_fini(lg);
 err_micom:
 	put_device(&lg->micom->dev);
@@ -761,7 +764,6 @@ static void lg1314_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&lg->drm);
 	drm_atomic_helper_shutdown(&lg->drm);
-	lg1314_dovi_fini(lg);
 	lg1314_video_fini(lg);
 	put_device(&lg->micom->dev);
 }

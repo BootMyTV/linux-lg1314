@@ -25,6 +25,19 @@ struct drm_pending_vblank_event;
 struct lg1314_vdec;
 struct lg1314_vdec_vo;
 struct lg1314_hdr_fw;
+struct lg1314_dovi_dm_state;
+
+#define LG1314_STATUS_LEN	512
+
+/* A Dolby Vision stream as shown (lg1314_status.c); luminances 1/10000 cd/m². */
+struct lg1314_dovi_status {
+	unsigned int	profile;
+	unsigned int	dm;			/* 3, 4; 0: not known yet */
+	unsigned int	trims;			/* L2 (DM3) or L8 (DM4) sets */
+	unsigned int	cm_version;		/* DM4: level 254's version */
+	u32		src_min, src_max;	/* the mastering display */
+	u32		tgt_min, tgt_max;	/* the target */
+};
 
 /* MMIO regions (the bring-up tables use absolute phys addresses). */
 enum lg1314_region {
@@ -299,6 +312,8 @@ struct lg1314_drm {
 		const struct lg1314_hdr_fw *fw;	/* NULL: no HDR10 */
 		void __iomem		*area;	/* table area for the DE firmware */
 		u32			nits;	/* peak the tone map is for */
+		u32			mdl_min;	/* the stream's: 1/10000 cd/m² */
+		u16			mdl_max, max_cll, max_fall;	/* cd/m² */
 		bool			hdr10;
 		bool			applied;
 		u32			blob_id;
@@ -307,11 +322,20 @@ struct lg1314_drm {
 	/* Dolby Vision (lg1314_dovi.c) */
 	struct {
 		void __iomem		*ring;	/* records for the DE firmware */
-		const struct firmware	*fw;
+		struct lg1314_dovi_dm_state *dm; /* their DM part */
 		unsigned int		next;	/* slot for the next record */
 		unsigned int		misses;	/* requests without a record */
 		bool			active;
+		struct lg1314_dovi_status status;
 	} dovi;
+
+	/* What the panel shows, for userspace (lg1314_status.c) */
+	struct {
+		struct mutex		lock;
+		char			text[LG1314_STATUS_LEN];
+		int			len;
+		unsigned int		seq;
+	} status;
 
 	/* channel-power register value preserved from lxboot at probe */
 	u32				chpower_save;
@@ -348,13 +372,16 @@ bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 struct drm_atomic_state;
 void lg1314_hdr_init(struct lg1314_drm *lg);
+int  lg1314_status_init(struct lg1314_drm *lg);
+void lg1314_status_update(struct lg1314_drm *lg);
 int  lg1314_hdr_init_props(struct lg1314_drm *lg);
 void lg1314_hdr_edid(struct drm_connector *connector);
 void lg1314_hdr_commit(struct lg1314_drm *lg, struct drm_atomic_state *state);
 int  lg1314_dovi_init(struct lg1314_drm *lg, int irq);
-void lg1314_dovi_fini(struct lg1314_drm *lg);
-int  lg1314_dovi_start(struct lg1314_drm *lg);
+int  lg1314_dovi_start(struct lg1314_drm *lg, unsigned int profile);
 void lg1314_dovi_stop(struct lg1314_drm *lg);
+void lg1314_dovi_attach(struct lg1314_drm *lg, struct lg1314_vdec *vdec);
+void lg1314_dovi_detach(struct lg1314_drm *lg);
 u32  lg1314_dovi_pts90(u64 ns);
 void lg1314_dovi_queue(struct lg1314_drm *lg, u32 pts90,
 		       const struct lg1314_dovi_pic *pic);

@@ -233,6 +233,11 @@ struct dec_slot {
 	bool			user;		/* handed to userspace, not yet queued
 						 * again (a picture, an error or the
 						 * end-of-stream marker) */
+	unsigned int		vo_refs;	/* frames of it the video output holds */
+	char			out_how;	/* how last handed out (debugfs): p
+						 * picture, e errored picture, x empty
+						 * error, L end of stream, s stopped */
+	bool			deferred;	/* returned while it did (counted) */
 	u32			shown_addr;	/* that picture, for the firmware */
 	u32			shown_gen;	/* in that session */
 	u32			shown_priv;	/* its firmware key (vdec_priv) */
@@ -245,6 +250,14 @@ static DEFINE_SPINLOCK(dec_dpb_lock);
 
 static bool dec_zerocopy = true;
 module_param_named(zerocopy, dec_zerocopy, bool, 0644);
+
+/* Keep a returned picture from the firmware while the video output holds it
+ * (debugging: off lets the firmware decode into pictures still queued). */
+static bool dec_vo_defer = true;
+module_param_named(vo_defer, dec_vo_defer, bool, 0644);
+
+/* Firmware picture buffer requests: all, and those answered "nothing" */
+static atomic_t dec_dpb_asked = ATOMIC_INIT(0), dec_dpb_refused = ATOMIC_INIT(0);
 
 MODULE_PARM_DESC(zerocopy, "decode into CAPTURE buffers (else copy pictures into them)");
 
@@ -278,6 +291,9 @@ struct dec_ctx {
 	 * slot state, and the session of the picture shown in it. */
 	int			wait_index;
 	u32			wait_state;
+	/* pictures returned while the video output still showed them, whose
+	 * release to the firmware waited for it (debugfs) */
+	unsigned int		unref_deferred;
 	bool			cpb_full;
 	bool			draining;	/* STOP received */
 	bool			eos_sent;
@@ -824,6 +840,9 @@ static void dec_session_close(struct dec_ctx *ctx)
 			 0, &result);
 	dev_dbg(ctx->dec->dev, "ctx %p: session %#x closed\n", ctx, ctx->handle);
 	WRITE_ONCE(ctx->handle, 0);
+	/* its input queue with it: a full one would keep the next session's
+	 * first access unit (which opens it) from ever being fed */
+	ctx->cpb_full = false;
 	lg1314_vdec_pictures_unlock(ctx->dec->v, true);
 }
 
@@ -1212,6 +1231,15 @@ static void dec_release_returned(struct dec_ctx *ctx)
 
 		if (!sl || !sl->shown || !sl->back)
 			continue;
+		/* still queued or on screen: the firmware would decode into
+		 * it (lg1314_vdec_dec_vo_hold() calls this again) */
+		if (sl->vo_refs) {
+			if (!sl->deferred)
+				ctx->unref_deferred++;
+			sl->deferred = true;
+			continue;
+		}
+		sl->deferred = false;
 		if (sl->fw && sl->shown_gen == ctx->gen)
 			addr[n++] = sl->shown_addr;
 		sl->shown = sl->back = false;
@@ -1225,6 +1253,42 @@ static void dec_release_returned(struct dec_ctx *ctx)
 	for (i = 0; i < n && ctx->handle; i++)
 		dec_fw_ioctl(ctx, FW_UNREF_DECODEBUFFER, 0, &addr[i]);
 	lg1314_vdec_pictures_unlock(ctx->dec->v, true);
+}
+
+/*
+ * The video output took (@hold) or let go of a frame of the decoder picture
+ * at @addr. A picture userspace returned meanwhile goes back to the firmware
+ * once the output lets go of it.
+ */
+void lg1314_vdec_dec_vo_hold(struct lg1314_vdec_dec *dec, u32 addr, bool hold)
+{
+	struct dec_ctx *ctx, *kick = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	if (!dec || (hold && !READ_ONCE(dec_vo_defer)))
+		return;
+	spin_lock_irqsave(&dec->ctxs_lock, flags);
+	spin_lock(&dec_dpb_lock);
+	list_for_each_entry(ctx, &dec->ctxs, node) {
+		for (i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
+			struct dec_slot *sl = ctx->slots[i];
+
+			if (!sl || addr < sl->phys || addr - sl->phys >= sl->size)
+				continue;
+			if (hold) {
+				sl->vo_refs++;
+			} else if (sl->vo_refs && !--sl->vo_refs && sl->deferred) {
+				kick = ctx;
+			}
+			goto out;
+		}
+	}
+out:
+	spin_unlock(&dec_dpb_lock);
+	if (kick)
+		queue_work(kick->dec->wq, &kick->noti_work);	/* release it */
+	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
 }
 
 u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
@@ -1288,12 +1352,14 @@ u32 lg1314_vdec_dec_dpb_alloc(struct lg1314_vdec_dec *dec, u32 size, u32 align,
 			several = true;
 		pick = fit;
 	}
+	atomic_inc(&dec_dpb_asked);
 	if (pick && !several) {
 		pick->fw = true;
 		*cookie = pick;
 	} else {
 		pick = NULL;
 		*wait = held_only;
+		atomic_inc(&dec_dpb_refused);
 	}
 	spin_unlock(&dec_dpb_lock);
 	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
@@ -1417,14 +1483,17 @@ void lg1314_vdec_dec_dpb_free(void *cookie)
 }
 
 /* A CAPTURE buffer goes to userspace. */
-static void dec_slot_handed_out(struct dec_ctx *ctx, struct vb2_v4l2_buffer *dst)
+static void dec_slot_handed_out(struct dec_ctx *ctx, struct vb2_v4l2_buffer *dst,
+				char how)
 {
 	struct dec_slot *sl;
 
 	spin_lock(&dec_dpb_lock);
 	sl = dec_slot_get(ctx, dst->vb2_buf.index);
-	if (sl)
+	if (sl) {
 		sl->user = true;
+		sl->out_how = how;
+	}
 	spin_unlock(&dec_dpb_lock);
 }
 
@@ -1493,7 +1562,7 @@ static void dec_deliver(struct dec_ctx *ctx)
 
 		if (!ok) {
 			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
-			dec_slot_handed_out(ctx, dst);
+			dec_slot_handed_out(ctx, dst, 'x');
 			v4l2_m2m_buf_done(dst, VB2_BUF_STATE_ERROR);
 		} else {
 			dst->vb2_buf.timestamp = dec_picture_timestamp(ctx, &f->d);
@@ -1504,7 +1573,8 @@ static void dec_deliver(struct dec_ctx *ctx)
 			dst->flags |= f->d.picture_type == FW_PIC_I ? V4L2_BUF_FLAG_KEYFRAME :
 				      f->d.picture_type == FW_PIC_P ? V4L2_BUF_FLAG_PFRAME :
 				      V4L2_BUF_FLAG_BFRAME;
-			dec_slot_handed_out(ctx, dst);
+			dec_slot_handed_out(ctx, dst, f->d.report & FW_REPORT_ERROR_MASK ?
+					    'e' : 'p');
 			v4l2_m2m_buf_done(dst, f->d.report & FW_REPORT_ERROR_MASK ?
 					  VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE);
 		}
@@ -1520,7 +1590,7 @@ static void dec_deliver(struct dec_ctx *ctx)
 			ctx->eos_reported = false;
 			ctx->draining = false;
 			vb2_set_plane_payload(&dst->vb2_buf, 0, 0);
-			dec_slot_handed_out(ctx, dst);
+			dec_slot_handed_out(ctx, dst, 'L');
 			v4l2_m2m_last_buffer_done(m2m_ctx, dst);
 			dec_signal_eos(ctx);
 		}
@@ -1792,8 +1862,10 @@ static void dec_dovi_rpu(struct dec_ctx *ctx, const u8 *data, size_t size, u64 u
 	dovi_composer_regs(&rpu, ctx->visible.width, ctx->visible.height,
 			   p->pic.comp);
 	p->pic.dm_valid = rpu.dm;
-	if (rpu.dm)
+	if (rpu.dm) {
 		p->pic.dm = *rpu.dm;
+		lg1314_vdec_dovi_parsed(ctx->dec->v, rpu.dm);
+	}
 	p->profile = rpu.profile;
 	smp_wmb();
 	WRITE_ONCE(p->uid, uid);
@@ -2113,7 +2185,7 @@ static void dec_return_bufs(struct dec_ctx *ctx, bool output,
 	while ((vb = output ? v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx) :
 			     v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx))) {
 		if (!output)
-			dec_slot_handed_out(ctx, vb);
+			dec_slot_handed_out(ctx, vb, 's');
 		v4l2_m2m_buf_done(vb, state);
 	}
 }
@@ -2149,6 +2221,7 @@ static int dec_start_streaming(struct vb2_queue *vq, unsigned int count)
 			memset(ctx->dovi_st, 0, sizeof(*ctx->dovi_st));
 		/* HEVC: opened with its first access unit (Dolby Vision or not) */
 		ctx->open_pending = dec_is_hevc(ctx);
+		ctx->cpb_full = false;
 		if (!ctx->open_pending)
 			ret = dec_session_open(ctx);
 	} else {
@@ -2600,6 +2673,10 @@ static int dec_status_show(struct seq_file *m, void *unused)
 			   ctx->eos_sent, ctx->eos_reported);
 		seq_printf(m, "  picture buffers lent %u, held by userspace %u, CAPTURE wanted %u\n",
 			   lent, held, ctx->cap_min);
+		seq_printf(m, "  pictures returned while the video output held them: %u\n",
+			   ctx->unref_deferred);
+		seq_printf(m, "  firmware picture buffer requests: %d, answered nothing: %d (all decoders)\n",
+			   atomic_read(&dec_dpb_asked), atomic_read(&dec_dpb_refused));
 		if (!ctx->bufstat_ret)
 			seq_printf(m, "  firmware input (at last status write): %u access units, %u frames, CPB %u of %u bytes\n",
 				   ctx->bufstat.auib_depth, ctx->bufstat.frame_count,
@@ -2611,6 +2688,37 @@ static int dec_status_show(struct seq_file *m, void *unused)
 				   ctx->wait_index, ctx->wait_state & 1,
 				   ctx->wait_state >> 1 & 1, ctx->wait_state >> 2 & 1,
 				   ctx->wait_state >> 8);
+		/* each CAPTURE buffer: lent to the firmware, handed to
+		 * userspace (and not queued again), the picture it shows
+		 * (session; returned), frames of it the video output holds */
+		spin_lock(&dec_dpb_lock);
+		for (i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
+			static const char *const st[] = {
+				[VB2_BUF_STATE_DEQUEUED] = "dequeued",
+				[VB2_BUF_STATE_IN_REQUEST] = "in-request",
+				[VB2_BUF_STATE_PREPARING] = "preparing",
+				[VB2_BUF_STATE_QUEUED] = "queued",
+				[VB2_BUF_STATE_ACTIVE] = "active",
+				[VB2_BUF_STATE_DONE] = "done (not dequeued)",
+				[VB2_BUF_STATE_ERROR] = "error (not dequeued)",
+			};
+			struct vb2_queue *q = v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx);
+			struct vb2_buffer *vb = i < q->max_num_buffers ?
+						vb2_get_buffer(q, i) : NULL;
+			struct dec_slot *sl = ctx->slots[i];
+
+			if (!sl)
+				continue;
+			seq_printf(m, "    buf %2u @%08x: %s%s%s%s picture gen %u%s, output holds %u%s; vb2 %s, last out %c\n",
+				   i, sl->phys, sl->vb ? "vb" : "--",
+				   sl->fw ? " lent" : "", sl->user ? " user" : "",
+				   sl->shown ? " shown" : "", sl->shown_gen,
+				   sl->back ? " returned" : "", sl->vo_refs,
+				   sl->deferred ? " (release waits)" : "",
+				   vb && vb->state < ARRAY_SIZE(st) && st[vb->state] ?
+				   st[vb->state] : "?", sl->out_how ? sl->out_how : '-');
+		}
+		spin_unlock(&dec_dpb_lock);
 	}
 	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
 	return 0;

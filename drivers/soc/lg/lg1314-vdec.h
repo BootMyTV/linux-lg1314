@@ -14,6 +14,7 @@ struct device;
 struct lg1314_vdec;
 struct lg1314_vdec_pt;
 struct lg1314_dovi_pic;
+struct lg1314_dovi_dm;
 
 /* Host->firmware calls (lg1314_vdec_call). */
 enum {
@@ -71,6 +72,13 @@ u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c);
 int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
 				 u64 *timestamp, u32 *session,
 				 struct lg1314_dovi_pic *pic);
+/* An access unit's Dolby Vision DM metadata, parsed as it is fed: to the
+ * listener (lg1314_vdec_set_dovi_listener). Process context. */
+void lg1314_vdec_dovi_parsed(struct lg1314_vdec *v, const struct lg1314_dovi_dm *dm);
+/* The video output holds (or no longer holds) a frame of the decoder picture
+ * at @addr: it isn't given back to the firmware meanwhile. */
+void lg1314_vdec_dec_vo_hold(struct lg1314_vdec_dec *dec, u32 addr, bool hold);
+void lg1314_vdec_vo_hold(struct lg1314_vdec *v, u32 addr, bool hold);
 /* Around looking a picture up and handing it to the video output (reader),
  * or closing a decoder session, which frees its pictures (@closing). */
 void lg1314_vdec_pictures_lock(struct lg1314_vdec *v, bool closing);

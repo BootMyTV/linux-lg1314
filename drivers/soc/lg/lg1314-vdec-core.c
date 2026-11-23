@@ -261,6 +261,10 @@ struct lg1314_vdec {
 	 * session writes. */
 	struct rw_semaphore	pictures_lock;
 
+	spinlock_t		dovi_lock;	/* the Dolby Vision listener */
+	lg1314_vdec_dovi_fn	dovi_fn;
+	void			*dovi_data;
+
 	struct lg1314_vdec_pt	*pt;		/* raw decoder interface, if built */
 	struct lg1314_vdec_dec	*dec;		/* V4L2 decoder */
 
@@ -677,6 +681,11 @@ void lg1314_vdec_pictures_unlock(struct lg1314_vdec *v, bool closing)
 		up_read(&v->pictures_lock);
 }
 
+void lg1314_vdec_vo_hold(struct lg1314_vdec *v, u32 addr, bool hold)
+{
+	lg1314_vdec_dec_vo_hold(v->dec, addr, hold);
+}
+
 u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c)
 {
 	return lg1314_vdec_dec_picture_priv(v->dec, addr, addr_c);
@@ -688,6 +697,24 @@ int lg1314_vdec_picture_dovi(struct lg1314_vdec *v, u32 addr, u64 *timestamp,
 	return lg1314_vdec_dec_picture_dovi(v->dec, addr, timestamp, session, pic);
 }
 EXPORT_SYMBOL_GPL(lg1314_vdec_picture_dovi);
+
+void lg1314_vdec_set_dovi_listener(struct lg1314_vdec *v, lg1314_vdec_dovi_fn fn,
+				   void *data)
+{
+	spin_lock(&v->dovi_lock);
+	v->dovi_fn = fn;
+	v->dovi_data = data;
+	spin_unlock(&v->dovi_lock);
+}
+EXPORT_SYMBOL_GPL(lg1314_vdec_set_dovi_listener);
+
+void lg1314_vdec_dovi_parsed(struct lg1314_vdec *v, const struct lg1314_dovi_dm *dm)
+{
+	spin_lock(&v->dovi_lock);
+	if (v->dovi_fn)
+		v->dovi_fn(v->dovi_data, dm);
+	spin_unlock(&v->dovi_lock);
+}
 
 static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 			  u32 size, u32 align, const char *name)
@@ -1478,6 +1505,7 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	v->dev = dev;
 	spin_lock_init(&v->send_lock);
+	spin_lock_init(&v->dovi_lock);
 	spin_lock_init(&v->wait_lock);
 	INIT_LIST_HEAD(&v->waiters);
 	INIT_LIST_HEAD(&v->hma_allocs);

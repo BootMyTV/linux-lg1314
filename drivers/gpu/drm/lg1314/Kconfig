@@ -4,6 +4,7 @@ config DRM_LG1314
 	depends on DRM && OF
 	depends on ARCH_LG1K || COMPILE_TEST
 	depends on LG1314_VDEC
+	depends on ARCH_HAS_KERNEL_FPU_SUPPORT
 	select APERTURE_HELPERS
 	select DRM_CLIENT_SELECTION
 	select DRM_GEM_DMA_HELPER

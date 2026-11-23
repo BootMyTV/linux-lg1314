@@ -8,6 +8,7 @@
  * changes arrive as a message; the events themselves are read with a call.
  */
 
+#include <linux/dev_printk.h>
 #include <linux/ioctl.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -69,6 +70,8 @@ struct fw_vo_info {
 
 #define FW_POLLIN			0x1
 
+#define VO_HELD_MAX		16	/* decoder pictures in flight */
+
 struct lg1314_vdec_vo {
 	struct lg1314_vdec		*v;
 	u32				handle;
@@ -85,6 +88,14 @@ struct lg1314_vdec_vo {
 
 	u32				*extra;	/* per-picture extra block, or NULL */
 	u32				extra_phys;
+
+	/* Decoder pictures the output holds, by frame id (held_lock), until
+	 * it releases them: the decoder keeps them meanwhile. */
+	spinlock_t			held_lock;
+	struct {
+		u32	id, addr;
+		bool	used;
+	} held[VO_HELD_MAX];
 };
 
 static LIST_HEAD(vo_list);
@@ -127,6 +138,58 @@ static int vo_ioctl(struct lg1314_vdec_vo *vo, unsigned int cmd, u32 arg,
 	return 0;
 }
 
+/* The output has frame @id of the decoder picture at @addr. */
+static void vo_hold(struct lg1314_vdec_vo *vo, u32 id, u32 addr)
+{
+	unsigned int i;
+
+	spin_lock(&vo->held_lock);
+	for (i = 0; i < VO_HELD_MAX && vo->held[i].used; i++)
+		;
+	if (i < VO_HELD_MAX) {
+		vo->held[i].id = id;
+		vo->held[i].addr = addr;
+		vo->held[i].used = true;
+	}
+	spin_unlock(&vo->held_lock);
+	if (i < VO_HELD_MAX)
+		lg1314_vdec_vo_hold(vo->v, addr, true);
+	else
+		dev_warn_ratelimited(lg1314_vdec_device(vo->v),
+				     "vo %#x: more than %u pictures held\n",
+				     vo->handle, VO_HELD_MAX);
+}
+
+/* The output let go of frame @id. */
+static void vo_unhold(struct lg1314_vdec_vo *vo, u32 id)
+{
+	unsigned int i;
+	u32 addr = 0;
+
+	spin_lock(&vo->held_lock);
+	for (i = 0; i < VO_HELD_MAX; i++) {
+		if (vo->held[i].used && vo->held[i].id == id) {
+			vo->held[i].used = false;
+			addr = vo->held[i].addr;
+			break;
+		}
+	}
+	spin_unlock(&vo->held_lock);
+	if (i < VO_HELD_MAX)
+		lg1314_vdec_vo_hold(vo->v, addr, false);
+}
+
+static void vo_unhold_all(struct lg1314_vdec_vo *vo)
+{
+	unsigned int i;
+
+	for (i = 0; i < VO_HELD_MAX; i++)
+		if (vo->held[i].used) {
+			vo->held[i].used = false;
+			lg1314_vdec_vo_hold(vo->v, vo->held[i].addr, false);
+		}
+}
+
 static void vo_event_work(struct work_struct *work)
 {
 	struct lg1314_vdec_vo *vo = container_of(work, struct lg1314_vdec_vo, work);
@@ -148,6 +211,7 @@ static void vo_event_work(struct work_struct *work)
 			break;
 		case VO_EV_OFF:
 		case VO_EV_DROP:
+			vo_unhold(vo, info.priv);
 			vo->ops->released(vo->ctx, info.priv);
 			break;
 		}
@@ -191,6 +255,7 @@ struct lg1314_vdec_vo *lg1314_vdec_vo_open(struct lg1314_vdec *v,
 	vo->ctx = ctx;
 	mutex_init(&vo->lock);
 	INIT_WORK(&vo->work, vo_event_work);
+	spin_lock_init(&vo->held_lock);
 
 	ret = lg1314_vdec_call(v, VDEC_CALL_VO_OPEN, 0, NULL, 0, 0, &handle);
 	if (!ret && !handle)
@@ -308,8 +373,12 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 		if (!ret)
 			vo->fb = fb;
 	}
+	if (f->tiled && !ret)
+		vo_hold(vo, f->id, f->addr_y);
 	if (!ret)
 		ret = vo_ioctl(vo, VO_WRITE_PICTURE, 0, &w);
+	if (f->tiled && ret)
+		vo_unhold(vo, f->id);
 	mutex_unlock(&vo->lock);
 	if (f->tiled)
 		lg1314_vdec_pictures_unlock(vo->v, false);
@@ -346,6 +415,8 @@ void lg1314_vdec_vo_close(struct lg1314_vdec_vo *vo)
 	vo_ioctl(vo, VO_SET_OUTPUT_PORT, 0, &port);
 	lg1314_vdec_call(vo->v, VDEC_CALL_VO_CLOSE, vo->handle, NULL, 0, 0,
 			 &result);
+	/* the closed output shows nothing more */
+	vo_unhold_all(vo);
 	if (vo->extra)
 		lg1314_vdec_mem_free(vo->v, vo->extra, vo->extra_phys, VO_EXTRA_SIZE);
 	kfree(vo);
