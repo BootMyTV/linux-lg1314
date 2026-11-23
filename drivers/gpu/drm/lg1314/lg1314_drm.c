@@ -85,6 +85,51 @@ u32 lg1314_rd(struct lg1314_drm *lg, u32 phys)
  * the mode's rate, locked to the video output's tick (lg1314_de_frame_lock).
  */
 
+/*
+ * Refresh rates (mHz): the video output's tick, half the panel's 96, 100 or
+ * 120 Hz. Film and PAL-rate video take twice its frame rate (Kodi matches
+ * double rates), each picture on screen for two ticks.
+ */
+static const unsigned int lg1314_refresh[] = { 47952, 48000, 50000, 59940, 60000 };
+
+/* A mode's refresh, one of lg1314_refresh[] (0: none). */
+static unsigned int lg1314_mode_refresh(const struct drm_display_mode *m)
+{
+	u64 mhz;
+	int i;
+
+	if (!m->htotal || !m->vtotal)
+		return 0;
+	mhz = div_u64((u64)m->clock * 1000000, m->htotal * m->vtotal);
+	for (i = 0; i < ARRAY_SIZE(lg1314_refresh); i++)
+		if (abs((s64)mhz - lg1314_refresh[i]) * 5000 <= lg1314_refresh[i])
+			return lg1314_refresh[i];
+	return 0;
+}
+
+static unsigned int lg1314_panel_hz(unsigned int refresh_mhz)
+{
+	return refresh_mhz < 49000 ? 96 : refresh_mhz < 55000 ? 100 : 120;
+}
+
+/* The panel and the video output follow the mode's refresh. */
+static void lg1314_crtc_set_refresh(struct lg1314_drm *lg,
+				    const struct drm_display_mode *m)
+{
+	unsigned int r = lg1314_mode_refresh(m) ?: 60000;
+
+	if (r == lg->refresh_mhz)
+		return;
+	drm_dbg_kms(&lg->drm, "refresh %u.%03u Hz, panel %u Hz\n",
+		    r / 1000, r % 1000, lg1314_panel_hz(r));
+	lg->refresh_mhz = r;
+	if (lg->de_fw_loaded)
+		lg1314_de_frame_lock(lg, lg1314_panel_hz(r));
+	lg1314_video_set_tick(lg, r);
+	drm_calc_timestamping_constants(&lg->crtc, m);
+	lg1314_status_update(lg);
+}
+
 static const u32 lg1314_formats[] = {
 	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
@@ -229,6 +274,7 @@ static irqreturn_t lg1314_video_tick_irq(int irq, void *arg)
 		if (!lg->tick_n++)
 			lg->tick_first_ns = now;
 		lg->tick_last_ns = now;
+		WRITE_ONCE(lg->tick_seq, lg->tick_seq + 1);
 		drm_crtc_handle_vblank(&lg->crtc);
 	}
 	return IRQ_HANDLED;
@@ -283,6 +329,7 @@ static void lg1314_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (ret)
 		return;
 
+	lg1314_crtc_set_refresh(lg, &crtc->state->adjusted_mode);
 	lg1314_osd_init(lg);
 
 	ret = lg1314_ovi_enable(lg);
@@ -300,7 +347,7 @@ static void lg1314_crtc_atomic_enable(struct drm_crtc *crtc,
 			goto err_ovi;
 		lg->de_fw_loaded = true;
 		if (!lg1314_de_wait_ready(lg)) {
-			lg1314_de_frame_lock(lg);
+			lg1314_de_frame_lock(lg, lg1314_panel_hz(lg->refresh_mhz));
 			lg1314_hdr_init(lg);
 		}
 	}
@@ -359,6 +406,8 @@ static void lg1314_crtc_atomic_flush(struct drm_crtc *crtc,
 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_pending_vblank_event *event;
 
+	if (cs->active)
+		lg1314_crtc_set_refresh(to_lg1314(crtc->dev), &cs->adjusted_mode);
 	lg1314_hdr_commit(to_lg1314(crtc->dev), state);
 
 	spin_lock_irq(&crtc->dev->event_lock);
@@ -373,7 +422,34 @@ static void lg1314_crtc_atomic_flush(struct drm_crtc *crtc,
 	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
+static enum drm_mode_status
+lg1314_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *m)
+{
+	return lg1314_mode_refresh(m) ? MODE_OK : MODE_BAD_VSCAN;
+}
+
+/*
+ * A change of refresh alone (same size, the CRTC staying on) needs no
+ * modeset: the flush retimes the panel and the video output, without the
+ * panel power cycle of a full disable/enable.
+ */
+static int lg1314_crtc_atomic_check(struct drm_crtc *crtc,
+				    struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(state, crtc);
+
+	if (cs->mode_changed && cs->active && old->active &&
+	    !cs->active_changed && !cs->connectors_changed &&
+	    cs->mode.hdisplay == old->mode.hdisplay &&
+	    cs->mode.vdisplay == old->mode.vdisplay)
+		cs->mode_changed = false;
+	return 0;
+}
+
 static const struct drm_crtc_helper_funcs lg1314_crtc_helper_funcs = {
+	.mode_valid = lg1314_crtc_mode_valid,
+	.atomic_check = lg1314_crtc_atomic_check,
 	.atomic_enable = lg1314_crtc_atomic_enable,
 	.atomic_disable = lg1314_crtc_atomic_disable,
 	.atomic_flush = lg1314_crtc_atomic_flush,
@@ -398,23 +474,34 @@ static const struct drm_crtc_funcs lg1314_crtc_funcs = {
  * the panel. Timings are nominal; the real panel timing is fixed by the OVI
  * VX1 table.
  */
+#define LG1314_MODE(clk, hd, hss, hse, ht, vd, vss, vse, vt, type) \
+	{ DRM_MODE("", DRM_MODE_TYPE_DRIVER | (type), clk, hd, hss, hse, ht, 0, \
+		   vd, vss, vse, vt, 0, DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) }
+/*
+ * The 1000/1001 clock, rounded up (74.176, 148.352, 593.407 MHz): Kodi takes
+ * a mode as a 1000/1001 rate only when its clock (kHz) isn't a multiple of 5.
+ */
+#define LG1314_CLK_1001(clk)	(((clk) * 1000 + 1000) / 1001)
+/* each size at 60, 59.94, 50, 48 and 47.952 Hz: the CEA clocks and lines */
+#define LG1314_MODES(clk, clk48, hd, hss, hse, ht60, ht50, ht48, vd, vss, vse, vt, type) \
+	LG1314_MODE(clk, hd, hss, hse, ht60, vd, vss, vse, vt, type),		\
+	LG1314_MODE(LG1314_CLK_1001(clk), hd, hss, hse, ht60, vd, vss, vse, vt, 0),	\
+	LG1314_MODE(clk, hd, hss, hse, ht50, vd, vss, vse, vt, 0),		\
+	LG1314_MODE(clk48, hd, hss, hse, ht48, vd, vss, vse, vt, 0),		\
+	LG1314_MODE(LG1314_CLK_1001(clk48), hd, hss, hse, ht48, vd, vss, vse, vt, 0)
+
 static const struct drm_display_mode lg1314_modes[] = {
 	/*
 	 * Native 4K plane (1:1, OSD buffer mode). NB: slips lines under heavy
 	 * memory traffic (OSD fetch starved on LBUS); see cfw/4k-osd.md.
 	 */
-	{ DRM_MODE("3840x2160", DRM_MODE_TYPE_DRIVER,
-		 594000, 3840, 4016, 4104, 4400, 0,
-		 2160, 2168, 2178, 2250, 0,
-		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
-	{ DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
-		 148500, 1920, 2008, 2052, 2200, 0,
-		 1080, 1084, 1089, 1125, 0,
-		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
-	{ DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER,
-		 74250, 1280, 1390, 1430, 1650, 0,
-		 720, 725, 730, 750, 0,
-		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC) },
+	LG1314_MODES(594000, 594000, 3840, 4016, 4104, 4400, 5280, 5500,
+		     2160, 2168, 2178, 2250, 0),
+	LG1314_MODES(148500, 148500, 1920, 2008, 2052, 2200, 2640, 2750,
+		     1080, 1084, 1089, 1125, DRM_MODE_TYPE_PREFERRED),
+	/* 720p48 (CEA has none): the 60 Hz lines at a lower clock */
+	LG1314_MODES(74250, 59400, 1280, 1390, 1430, 1650, 1980, 1650,
+		     720, 725, 730, 750, 0),
 };
 
 static int lg1314_conn_get_modes(struct drm_connector *connector)
@@ -429,6 +516,7 @@ static int lg1314_conn_get_modes(struct drm_connector *connector)
 		mode = drm_mode_duplicate(connector->dev, &lg1314_modes[i]);
 		if (!mode)
 			continue;
+		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
 		count++;
 	}
@@ -747,6 +835,7 @@ static int lg1314_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_video;
 	lg1314_de_debugfs_init(lg);
+	lg1314_video_debugfs_init(lg);
 
 	drm_client_setup(&lg->drm, NULL);
 	return 0;

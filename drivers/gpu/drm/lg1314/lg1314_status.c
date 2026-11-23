@@ -10,8 +10,11 @@
  *   dm=DM3			maxcll=1000 cd/m2
  *   metadata=CM v2.9, 1 L2 trim	maxfall=400 cd/m2
  *   mastering=0.0050-4000 cd/m2	tonemap=1000 cd/m2
- *   target=0.0010-600 cd/m2	seq=3
+ *   target=0.0010-600 cd/m2	refresh=47.952 Hz
+ *   refresh=47.952 Hz		seq=3
  *   seq=7
+ *
+ * refresh= is the mode's refresh rate, for every mode.
  */
 
 #include <linux/device.h>
@@ -78,6 +81,9 @@ static int status_text(struct lg1314_drm *lg, char *buf, size_t n)
 	} else {
 		len += scnprintf(buf + len, n - len, "mode=sdr\n");
 	}
+	if (lg->refresh_mhz)
+		len += scnprintf(buf + len, n - len, "refresh=%u.%03u Hz\n",
+				 lg->refresh_mhz / 1000, lg->refresh_mhz % 1000);
 	return len;
 }
 

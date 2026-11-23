@@ -9,7 +9,9 @@
  * until it is off screen.
  */
 
+#include <linux/debugfs.h>
 #include <linux/of.h>
+#include <linux/seq_file.h>
 #include <linux/soc/lg/lg1314-vdec-vo.h>
 
 #include <drm/drm_atomic.h>
@@ -28,12 +30,12 @@
 #define VIDEO_DE_CH		0	/* display-engine window / channel */
 
 /*
- * The output's tick runs off a clock that differs from the system's by a
- * fixed amount (0.5 % here). Ask for the rate that makes the real tick
- * 60 Hz, measured against the system clock once the output runs; refined a
- * few times, then kept for later outputs.
+ * The output ticks at the mode's refresh rate (lg1314_video_set_tick). Its
+ * clock may differ from the system's: once an output runs, the tick is
+ * measured against the system clock and the rate asked for corrected (in
+ * ppm, kept for later rates and outputs); refined a few times, then kept.
+ * Measured so far: no error, in free-run mode.
  */
-#define VIDEO_TICK_HZ		60
 #define VIDEO_CALIB_DELAY	msecs_to_jiffies(2000)
 #define VIDEO_CALIB_PASSES	3
 #define VIDEO_CALIB_MIN_TICKS	60
@@ -121,12 +123,99 @@ static int video_de_window(struct lg1314_drm *lg, struct lg1314_video *v,
 	return ret;
 }
 
+/* ---- frame timing trace ---- */
+
+static void video_trace(struct lg1314_video *v, char ev, u32 id, u32 addr)
+{
+	struct lg1314_drm *lg = to_lg1314(v->plane.dev);
+	struct lg1314_video_trace *t;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->trace_lock, flags);
+	t = &v->trace[v->trace_head++ % ARRAY_SIZE(v->trace)];
+	t->ns = ktime_get_ns();
+	t->tick = READ_ONCE(lg->tick_seq);
+	t->id = id;
+	t->addr = addr;
+	t->ev = ev;
+	spin_unlock_irqrestore(&v->trace_lock, flags);
+}
+
+#ifdef CONFIG_DEBUG_FS
+/*
+ * One line per event, oldest first: time (ns), video tick count, event (w:
+ * written to the output, s: on screen, r: off screen), frame id, and for a
+ * write the picture's luma address (a commit can repeat a picture). Writing
+ * anything clears it.
+ */
+static int video_trace_show(struct seq_file *m, void *unused)
+{
+	struct lg1314_video *v = m->private;
+	struct lg1314_video_trace *buf;
+	unsigned int head, n, i;
+	unsigned long flags;
+
+	buf = kvmalloc(sizeof(v->trace), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	spin_lock_irqsave(&v->trace_lock, flags);
+	memcpy(buf, v->trace, sizeof(v->trace));
+	head = v->trace_head;
+	spin_unlock_irqrestore(&v->trace_lock, flags);
+	n = min_t(unsigned int, head, ARRAY_SIZE(v->trace));
+	for (i = head - n; i != head; i++) {
+		struct lg1314_video_trace *t = &buf[i % ARRAY_SIZE(v->trace)];
+
+		seq_printf(m, "%llu %u %c %u %x\n", t->ns, t->tick, t->ev, t->id,
+			   t->addr);
+	}
+	kvfree(buf);
+	return 0;
+}
+
+static int video_trace_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, video_trace_show, inode->i_private);
+}
+
+static ssize_t video_trace_write(struct file *file, const char __user *ubuf,
+				 size_t len, loff_t *ppos)
+{
+	struct lg1314_video *v = ((struct seq_file *)file->private_data)->private;
+	unsigned long flags;
+
+	spin_lock_irqsave(&v->trace_lock, flags);
+	v->trace_head = 0;
+	spin_unlock_irqrestore(&v->trace_lock, flags);
+	return len;
+}
+
+static const struct file_operations video_trace_fops = {
+	.owner = THIS_MODULE,
+	.open = video_trace_open,
+	.read = seq_read,
+	.write = video_trace_write,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+void lg1314_video_debugfs_init(struct lg1314_drm *lg)
+{
+	if (lg->video.vdec_np)
+		debugfs_create_file("video_trace", 0600, lg->drm.debugfs_root,
+				    &lg->video, &video_trace_fops);
+}
+#else
+void lg1314_video_debugfs_init(struct lg1314_drm *lg) { }
+#endif
+
 /* ---- frame bookkeeping (callbacks run in process context) ---- */
 
 static void video_shown(void *ctx, u32 id)
 {
 	struct lg1314_video *v = ctx;
 
+	video_trace(v, 's', id, 0);
 	/* The window stays blanked until it has a picture to show. */
 	if (READ_ONCE(v->blanked)) {
 		video_de_blank(to_lg1314(v->plane.dev), false);
@@ -140,6 +229,7 @@ static void video_released(void *ctx, u32 id)
 	struct drm_framebuffer *fb = NULL;
 	int i;
 
+	video_trace(v, 'r', id, 0);
 	mutex_lock(&v->held_lock);
 	for (i = 0; i < ARRAY_SIZE(v->held); i++) {
 		if (v->held[i].fb && v->held[i].id == id) {
@@ -170,21 +260,51 @@ static void video_calibrate(struct work_struct *work)
 		return;
 	period = div_u64(READ_ONCE(lg->tick_last_ns) - READ_ONCE(lg->tick_first_ns),
 			 n - 1);
-	/* rate for 60 Hz = current rate * measured period / wanted period */
-	rate = div_u64((u64)v->rate_mhz * period * VIDEO_TICK_HZ + NSEC_PER_SEC / 2,
-		       NSEC_PER_SEC);
+	/* rate for the tick = current rate * measured period / wanted period */
+	rate = div64_u64((u64)v->rate_mhz * period * v->tick_mhz +
+			 NSEC_PER_SEC * 1000ULL / 2, NSEC_PER_SEC * 1000ULL);
 	drm_dbg_kms(v->plane.dev, "video tick %llu ns at %u mHz -> %u mHz\n",
 		    period, v->rate_mhz, rate);
 	if (rate != v->rate_mhz && rate <= U16_MAX &&
 	    !lg1314_vdec_vo_set_rate(v->vo, rate, 1000)) {
 		v->rate_mhz = rate;
+		v->corr_ppm = (int)div_u64((u64)rate * 1000000 + v->tick_mhz / 2,
+					   v->tick_mhz) - 1000000;
 		lg->tick_n = 0;
 	}
 	if (++v->calib_passes < VIDEO_CALIB_PASSES)
 		schedule_delayed_work(&v->calib_work, VIDEO_CALIB_DELAY);
 	else
-		drm_info(v->plane.dev, "video output rate %u.%03u Hz for a %u Hz tick\n",
-			 v->rate_mhz / 1000, v->rate_mhz % 1000, VIDEO_TICK_HZ);
+		drm_info(v->plane.dev, "video output rate %u.%03u Hz for a %u.%03u Hz tick (%d ppm)\n",
+			 v->rate_mhz / 1000, v->rate_mhz % 1000,
+			 v->tick_mhz / 1000, v->tick_mhz % 1000, v->corr_ppm);
+}
+
+/* The rate to ask the output for, for the wanted tick. */
+static unsigned int video_rate(const struct lg1314_video *v)
+{
+	return div_u64((u64)v->tick_mhz * (1000000 + v->corr_ppm) + 500000, 1000000);
+}
+
+/*
+ * The mode's refresh changed (or is first set): the output ticks at it from
+ * now on, an open one at once.
+ */
+void lg1314_video_set_tick(struct lg1314_drm *lg, unsigned int tick_mhz)
+{
+	struct lg1314_video *v = &lg->video;
+	unsigned int rate;
+
+	if (tick_mhz == v->tick_mhz)
+		return;
+	v->tick_mhz = tick_mhz;
+	rate = video_rate(v);
+	if (v->vo && rate != v->rate_mhz &&
+	    lg1314_vdec_vo_set_rate(v->vo, rate, 1000))
+		drm_err(v->plane.dev, "video output rate %u mHz not set\n", rate);
+	v->rate_mhz = rate;
+	/* the calibration measures the new tick from here */
+	lg->tick_n = 0;
 }
 
 static int video_hold(struct lg1314_video *v, struct drm_framebuffer *fb,
@@ -417,7 +537,7 @@ static void video_atomic_update(struct drm_plane *plane,
 		drm_err(plane->dev, "video frame write failed: %d\n", ret);
 		video_released(v, f.id);
 		return;
-	}
+	}	video_trace(v, 'w', f.id, f.addr_y);
 }
 
 static void video_atomic_disable(struct drm_plane *plane,
@@ -467,8 +587,10 @@ int lg1314_video_init(struct lg1314_drm *lg)
 	int ret;
 
 	mutex_init(&v->held_lock);
+	spin_lock_init(&v->trace_lock);
 	INIT_DELAYED_WORK(&v->calib_work, video_calibrate);
-	v->rate_mhz = VIDEO_TICK_HZ * 1000;
+	v->tick_mhz = 60000;
+	v->rate_mhz = 60000;
 	v->vdec_np = of_parse_phandle(lg->dev->of_node, "lge,vdec", 0);
 	if (!v->vdec_np) {
 		dev_info(lg->dev, "no lge,vdec: no video plane\n");

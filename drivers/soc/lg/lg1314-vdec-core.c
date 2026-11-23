@@ -757,7 +757,10 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 				     size, align, pool ? (pool == v->hma_cpb ? "cpb" : "vdec") : "dpb",
 				     name);
 		kfree(a);
-		if (!pool && !strcmp(name, "gx_dpb"))
+		/* The firmware gives up on the stream (a working buffer: the
+		 * codec never starts, decoding times out for ever): fail it,
+		 * so the player sees an error rather than a frozen picture. */
+		if (!pool)
 			lg1314_vdec_dec_dpb_failed(v->dec);
 		return 0;
 	}

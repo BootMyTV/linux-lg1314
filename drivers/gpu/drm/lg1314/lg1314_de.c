@@ -310,19 +310,20 @@ int lg1314_de_wait_ready(struct lg1314_drm *lg)
 }
 
 #define DE_CMD_SET_FR_RATE	0x1c
-#define DE_PANEL_RATE		120
 
 /*
  * Lock the panel timing to the video source (the decoder output's tick, at
- * half the panel rate), as the vendor driver does at playback.
+ * half the panel rate), as the vendor driver does at playback. The panel
+ * runs at 96, 100 or 120 Hz (the rates stock's frame lock uses); locked, it
+ * follows the source within that class (95.904 Hz for a 47.952 Hz tick).
  */
-int lg1314_de_frame_lock(struct lg1314_drm *lg)
+int lg1314_de_frame_lock(struct lg1314_drm *lg, unsigned int panel_hz)
 {
 	struct {
 		u32 force_free_run;
 		u16 rate;
 		u16 pad;
-	} fr = { .force_free_run = 0, .rate = DE_PANEL_RATE };
+	} fr = { .force_free_run = 0, .rate = panel_hz };
 
 	return lg1314_de_cmd(lg, DE_CMD_SET_FR_RATE, &fr, sizeof(fr));
 }

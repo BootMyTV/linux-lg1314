@@ -242,8 +242,12 @@ struct lg1314_video {
 	}				held[8];	/* not yet off screen */
 	struct mutex			held_lock;
 
-	/* output tick rate in mHz, calibrated so the tick is 60 Hz */
+	/* the tick wanted (the mode's refresh) and the output rate asked for
+	 * it, both in mHz; the output's clock error against the system's,
+	 * measured once the output runs, in ppm */
+	unsigned int			tick_mhz;
 	unsigned int			rate_mhz;
+	int				corr_ppm;
 	struct delayed_work		calib_work;
 	unsigned int			calib_passes;
 
@@ -255,6 +259,18 @@ struct lg1314_video {
 	u32				dovi_last_addr;	/* the picture last written */
 	u64				dovi_last_ts;
 	struct lg1314_dovi_pic		dovi_pic;
+
+	/* frame timing trace (debugfs video_trace): picture written, on
+	 * screen, off screen */
+	spinlock_t			trace_lock;
+	unsigned int			trace_head;
+	struct lg1314_video_trace {
+		u64			ns;
+		u32			tick;
+		u32			id;
+		u32			addr;	/* luma, at write */
+		char			ev;
+	}				trace[1024];
 
 	/* display-engine window state */
 	bool				src_set;
@@ -279,6 +295,9 @@ struct lg1314_drm {
 	/* video tick timing, for calibrating the output's rate */
 	unsigned int			tick_n;
 	u64				tick_first_ns, tick_last_ns;
+	u32				tick_seq;	/* ticks since boot */
+	/* the mode's refresh (mHz), which the video tick and the panel follow */
+	unsigned int			refresh_mhz;
 
 	/* panel power sequencing */
 	struct i2c_client		*micom;
@@ -356,10 +375,12 @@ int  lg1314_de_load_fw(struct lg1314_drm *lg);
 int  lg1314_de_cmd(struct lg1314_drm *lg, u32 cmd, const void *data, size_t len);
 int  lg1314_de_query(struct lg1314_drm *lg, u32 cmd, void *out, size_t len);
 int  lg1314_de_wait_ready(struct lg1314_drm *lg);
-int  lg1314_de_frame_lock(struct lg1314_drm *lg);
+int  lg1314_de_frame_lock(struct lg1314_drm *lg, unsigned int panel_hz);
 void lg1314_de_debugfs_init(struct lg1314_drm *lg);
 int  lg1314_video_init(struct lg1314_drm *lg);
 void lg1314_video_fini(struct lg1314_drm *lg);
+void lg1314_video_debugfs_init(struct lg1314_drm *lg);
+void lg1314_video_set_tick(struct lg1314_drm *lg, unsigned int tick_mhz);
 int  lg1314_panel_vcc(struct lg1314_drm *lg, bool on);
 int  lg1314_panel_evdd(struct lg1314_drm *lg, bool on);
 void lg1314_osd_init(struct lg1314_drm *lg);
