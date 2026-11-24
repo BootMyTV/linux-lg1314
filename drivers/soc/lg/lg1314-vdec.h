@@ -9,6 +9,7 @@
 #include <linux/bits.h>
 #include <linux/err.h>
 #include <linux/types.h>
+#include <linux/soc/lg/lg1314-hdr10plus.h>
 
 struct device;
 struct lg1314_vdec;
@@ -69,6 +70,8 @@ void lg1314_vdec_dec_dpb_free(void *cookie);
 u32 lg1314_vdec_dec_picture_priv(struct lg1314_vdec_dec *dec, u32 addr,
 				 u32 *addr_c);
 u32 lg1314_vdec_picture_priv(struct lg1314_vdec *v, u32 addr, u32 *addr_c);
+int lg1314_vdec_dec_picture_hdr10plus(struct lg1314_vdec_dec *dec, u32 addr,
+				      struct lg1314_hdr10plus *md);
 int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
 				 u64 *timestamp, u32 *session,
 				 struct lg1314_dovi_pic *pic);

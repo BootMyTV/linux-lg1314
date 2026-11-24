@@ -603,3 +603,123 @@ void dovi_composer_regs(const struct dovi_rpu *rpu, u32 width, u32 height,
 		regs[lay[c].mmr_ord] = m->mmr_order[c - 1];
 	}
 }
+
+/*
+ * HDR10+ (SMPTE ST 2094-40) in an HEVC prefix SEI NAL unit (from its start
+ * code): registered user data, country 0xB5, provider 0x003C, provider code
+ * 0x0001, application 4. The first window's parameters into @md; 0, or
+ * -ENOENT if the NAL unit carries none. @scratch holds @len bytes.
+ */
+static int hdr10plus_t35(const u8 *p, size_t n, struct lg1314_hdr10plus *md)
+{
+	struct bitreader b;
+	u32 nwin, w, i, k, v;
+
+	if (n < 7 || p[0] != 0xb5 || p[1] || p[2] != 0x3c || p[3] || p[4] != 1 ||
+	    p[5] != 4)
+		return -ENOENT;
+	b = (struct bitreader){ .p = p, .bits = n * 8, .pos = 7 * 8 };
+	memset(md, 0, sizeof(*md));
+	nwin = br_bits(&b, 2);
+	if (!nwin)
+		return -EINVAL;
+	for (w = 1; w < nwin; w++) {
+		for (i = 0; i < 6; i++)
+			br_bits(&b, 16);	/* window corners, ellipse centre */
+		br_bits(&b, 8);			/* rotation_angle */
+		for (i = 0; i < 3; i++)
+			br_bits(&b, 16);	/* ellipse axes */
+		br_bits(&b, 1);			/* overlap_process_option */
+	}
+	md->target_nits = br_bits(&b, 27);
+	if (br_bits(&b, 1)) {			/* targeted display's actual peaks */
+		v = br_bits(&b, 5) * br_bits(&b, 5);
+		for (i = 0; i < v; i++)
+			br_bits(&b, 4);
+	}
+	for (w = 0; w < nwin; w++) {
+		for (i = 0; i < 3; i++) {
+			v = br_bits(&b, 17);
+			if (!w)
+				md->maxscl[i] = v;
+		}
+		v = br_bits(&b, 17);
+		if (!w)
+			md->avg_maxrgb = v;
+		k = br_bits(&b, 4);		/* distribution percentiles */
+		for (i = 0; i < k; i++) {
+			br_bits(&b, 7);
+			v = br_bits(&b, 17);
+			if (!w && i == 8)
+				md->hm = v;
+		}
+		br_bits(&b, 10);		/* fraction_bright_pixels */
+	}
+	if (br_bits(&b, 1)) {			/* mastering display's actual peaks */
+		v = br_bits(&b, 5) * br_bits(&b, 5);
+		for (i = 0; i < v; i++)
+			br_bits(&b, 4);
+	}
+	for (w = 0; w < nwin; w++) {
+		if (br_bits(&b, 1)) {		/* tone_mapping_flag */
+			u16 kx = br_bits(&b, 12), ky = br_bits(&b, 12);
+
+			k = br_bits(&b, 4);
+			if (!w) {
+				md->knee_x = kx;
+				md->knee_y = ky;
+				md->num_anchors = k;
+			}
+			for (i = 0; i < k; i++) {
+				v = br_bits(&b, 10);
+				if (!w)
+					md->anchors[i] = v;
+			}
+		}
+		if (br_bits(&b, 1))		/* color_saturation_mapping_flag */
+			br_bits(&b, 6);
+	}
+	return b.err ? -EINVAL : 0;
+}
+
+int hdr10plus_parse_sei(const u8 *nal, size_t len, u8 *scratch,
+			struct lg1314_hdr10plus *md)
+{
+	size_t i = 0, n = 0, zeros = 0, size;
+	u32 type;
+
+	if (len >= 4 && !nal[0] && !nal[1] && !nal[2] && nal[3] == 1)
+		i = 4;
+	else if (len >= 3 && !nal[0] && !nal[1] && nal[2] == 1)
+		i = 3;
+	if (len < i + 2 || (nal[i] >> 1 & 0x3f) != 39)
+		return -ENOENT;
+	for (i += 2; i < len; i++) {
+		if (zeros >= 2 && nal[i] == 3) {
+			zeros = 0;
+			continue;
+		}
+		zeros = nal[i] ? 0 : zeros + 1;
+		scratch[n++] = nal[i];
+	}
+	/* sei_message()s up to the trailing bits */
+	for (i = 0; i + 1 < n;) {
+		type = size = 0;
+		while (i < n && scratch[i] == 0xff)
+			type += scratch[i++];
+		if (i >= n)
+			break;
+		type += scratch[i++];
+		while (i < n && scratch[i] == 0xff)
+			size += scratch[i++];
+		if (i >= n)
+			break;
+		size += scratch[i++];
+		if (size > n - i)
+			break;
+		if (type == 4 && !hdr10plus_t35(scratch + i, size, md))
+			return 0;
+		i += size;
+	}
+	return -ENOENT;
+}

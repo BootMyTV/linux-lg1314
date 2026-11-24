@@ -10,6 +10,7 @@
 #include <linux/types.h>
 #include <linux/videodev2.h>
 #include <linux/soc/lg/lg1314-dovi-meta.h>
+#include <linux/soc/lg/lg1314-hdr10plus.h>
 
 /*
  * The decoder's tiled picture layout (8x4 tiles, NV12 sizes and offsets): a
@@ -79,6 +80,10 @@ void lg1314_vdec_vo_close(struct lg1314_vdec_vo *vo);
  */
 int lg1314_vdec_picture_dovi(struct lg1314_vdec *v, u32 addr_y, u64 *timestamp,
 			     u32 *session, struct lg1314_dovi_pic *pic);
+
+/* A current decoder picture's HDR10+ metadata: 0, or -ENOENT (none). */
+int lg1314_vdec_picture_hdr10plus(struct lg1314_vdec *v, u32 addr_y,
+				  struct lg1314_hdr10plus *md);
 
 /*
  * Dolby Vision DM metadata as the decoder parses it, one call per access

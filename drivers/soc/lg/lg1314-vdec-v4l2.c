@@ -187,6 +187,7 @@ enum { FW_PIC_I, FW_PIC_P, FW_PIC_B };
 
 #define DEC_DOVI_RING		64	/* access units' composer images kept */
 #define DEC_DOVI_RPU_MAX	SZ_64K
+#define DEC_H10P_SEI_MAX	SZ_8K	/* larger SEI NAL units: not looked at */
 #define DEC_EL_AU_MAX		SZ_2M	/* an access unit's enhancement layer */
 #define FW_EOS			_IO(FW_IOC_TYPE, 47)
 
@@ -351,6 +352,14 @@ struct dec_ctx {
 		u8		profile;
 		struct lg1314_dovi_pic pic;
 	}			*dovi_pics;	/* DEC_DOVI_RING */
+
+	/* HDR10+ (not with Dolby Vision): each access unit's dynamic
+	 * metadata, by uid; allocated at the first SEI NAL unit */
+	struct dec_h10p_pic {
+		s64		uid;		/* -1: none */
+		struct lg1314_hdr10plus md;
+	}			*h10p_pics;	/* DEC_DOVI_RING */
+	u8			*h10p_buf;	/* an SEI NAL unit, unescaped */
 
 	/*
 	 * Profile 7 with a full enhancement layer (FEL): a second firmware
@@ -1823,6 +1832,48 @@ int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
 	return ret;
 }
 
+/* The display side: a decoder picture's HDR10+ metadata. 0, or -ENOENT. */
+int lg1314_vdec_dec_picture_hdr10plus(struct lg1314_vdec_dec *dec, u32 addr,
+				      struct lg1314_hdr10plus *md)
+{
+	struct dec_ctx *ctx;
+	unsigned long flags;
+	unsigned int i;
+	int ret = -ENOENT;
+
+	if (!dec)
+		return ret;
+	spin_lock_irqsave(&dec->ctxs_lock, flags);
+	spin_lock(&dec_dpb_lock);
+	list_for_each_entry(ctx, &dec->ctxs, node) {
+		for (i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
+			struct dec_slot *sl = ctx->slots[i];
+			struct dec_h10p_pic *p;
+			s64 uid;
+
+			if (!sl || !sl->shown || sl->back || sl->shown_addr != addr ||
+			    sl->shown_gen != ctx->gen || !READ_ONCE(ctx->handle))
+				continue;
+			uid = sl->shown_uid;
+			if (uid < 0 || !ctx->h10p_pics)
+				goto out;
+			p = &ctx->h10p_pics[uid % DEC_DOVI_RING];
+			if (READ_ONCE(p->uid) != uid)
+				goto out;
+			smp_rmb();
+			*md = p->md;
+			smp_rmb();
+			if (READ_ONCE(p->uid) == uid)
+				ret = 0;
+			goto out;
+		}
+	}
+out:
+	spin_unlock(&dec_dpb_lock);
+	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
+	return ret;
+}
+
 void lg1314_vdec_dec_dpb_failed(struct lg1314_vdec_dec *dec)
 {
 	struct dec_ctx *ctx;
@@ -2238,6 +2289,68 @@ static void dec_dovi_rpu(struct dec_ctx *ctx, const u8 *data, size_t size, u64 u
 	WRITE_ONCE(p->uid, uid);
 }
 
+static void dec_h10p_free(struct dec_ctx *ctx)
+{
+	kvfree(ctx->h10p_pics);
+	kfree(ctx->h10p_buf);
+	ctx->h10p_pics = NULL;
+	ctx->h10p_buf = NULL;
+}
+
+/* The access unit's HDR10+ metadata, kept by its uid. */
+static void dec_hdr10plus(struct dec_ctx *ctx, const u8 *data, size_t size, u64 uid)
+{
+	struct lg1314_hdr10plus md;
+	struct dec_h10p_pic *p;
+	bool found = false;
+	size_t i, end;
+	unsigned int k;
+
+	for (i = 0; i + 4 < size && !found; i++) {
+		u32 type;
+
+		if (data[i] || data[i + 1] || data[i + 2] != 1)
+			continue;
+		type = data[i + 3] >> 1 & 0x3f;
+		if (type < 32)
+			break;		/* slices: a prefix SEI comes before them */
+		if (type != 39)
+			continue;
+		for (end = i + 3; end + 2 < size; end++)
+			if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
+				break;
+		if (end + 2 >= size)
+			end = size;
+		if (end - i <= DEC_H10P_SEI_MAX) {
+			if (!ctx->h10p_pics) {
+				ctx->h10p_pics = kvcalloc(DEC_DOVI_RING,
+							  sizeof(*ctx->h10p_pics),
+							  GFP_KERNEL);
+				ctx->h10p_buf = kmalloc(DEC_H10P_SEI_MAX, GFP_KERNEL);
+				if (!ctx->h10p_pics || !ctx->h10p_buf) {
+					dec_h10p_free(ctx);
+					return;
+				}
+				for (k = 0; k < DEC_DOVI_RING; k++)
+					ctx->h10p_pics[k].uid = -1;
+			}
+			found = !hdr10plus_parse_sei(data + i, end - i,
+						     ctx->h10p_buf, &md);
+		}
+		i = end - 1;
+	}
+	if (!ctx->h10p_pics)
+		return;
+	p = &ctx->h10p_pics[uid % DEC_DOVI_RING];
+	WRITE_ONCE(p->uid, -1);
+	if (!found)
+		return;
+	smp_wmb();
+	p->md = md;
+	smp_wmb();
+	WRITE_ONCE(p->uid, uid);
+}
+
 static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 {
 	const void *data = vb2_plane_vaddr(&src->vb2_buf, 0);
@@ -2268,6 +2381,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	ctx->ts[es.uid % DEC_TS_RING] = src->vb2_buf.timestamp;
 	if (ctx->dovi)
 		dec_dovi_rpu(ctx, data, size, es.uid);
+	else if (dec_is_hevc(ctx))
+		dec_hdr10plus(ctx, data, size, es.uid);
 	es.size = size;
 	es.au_type = FW_AU_DATA;
 	/* a running frame number: the firmware counts what it holds with it */
@@ -2975,6 +3090,7 @@ static int dec_release(struct file *file)
 	v4l2_fh_exit(&ctx->fh);
 	v4l2_ctrl_handler_free(&ctx->ctrls);
 	dec_dovi_free(ctx);
+	dec_h10p_free(ctx);
 	kvfree(ctx->el.pics);
 	kvfree(ctx->el.au);
 	kvfree(ctx);

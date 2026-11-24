@@ -745,6 +745,13 @@ int lg1314_vdec_picture_dovi(struct lg1314_vdec *v, u32 addr, u64 *timestamp,
 }
 EXPORT_SYMBOL_GPL(lg1314_vdec_picture_dovi);
 
+int lg1314_vdec_picture_hdr10plus(struct lg1314_vdec *v, u32 addr,
+				  struct lg1314_hdr10plus *md)
+{
+	return lg1314_vdec_dec_picture_hdr10plus(v->dec, addr, md);
+}
+EXPORT_SYMBOL_GPL(lg1314_vdec_picture_hdr10plus);
+
 void lg1314_vdec_set_dovi_listener(struct lg1314_vdec *v, lg1314_vdec_dovi_fn fn,
 				   void *data)
 {

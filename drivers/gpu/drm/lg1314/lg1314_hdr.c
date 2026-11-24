@@ -35,6 +35,7 @@
 
 #include "lg1314_drm.h"
 #include "lg1314_hdr_tf.h"
+#include "lg1314_hdr10plus.h"
 
 /*
  * The vendor's tuned tables (tone curves, colour correction, gamut 3D LUTs),
@@ -190,6 +191,19 @@ MODULE_PARM_DESC(hdr_dtm_oled, "With dynamic tone mapping: dim highlights in bri
 static bool hdr_dtm_debug;
 module_param(hdr_dtm_debug, bool, 0644);
 MODULE_PARM_DESC(hdr_dtm_debug, "Log scene changes");
+/*
+ * HDR10+ (SMPTE ST 2094-40): the scene's metadata makes the HDR10 curve
+ * (lg1314_hdr10plus.c), ahead of dynamic tone mapping. Its output's full
+ * scale is the panel's peak as the static curves have it.
+ */
+static bool hdr_hdr10plus = true;
+module_param(hdr_hdr10plus, bool, 0644);
+MODULE_PARM_DESC(hdr_hdr10plus, "HDR10+: tone map each scene by its metadata (off: as HDR10)");
+static unsigned int hdr10plus_panel = 700;
+module_param(hdr10plus_panel, uint, 0644);
+MODULE_PARM_DESC(hdr10plus_panel, "HDR10+: the panel peak the curve maps to, cd/m2");
+/* pictures shown without metadata before a stream counts as plain HDR10 */
+#define H10P_MISSING_MAX	12
 
 struct lg1314_hdr_cc {
 	__le32 lgain_x[8], lgain_y[8], sgain_x[8], sgain_y[8];
@@ -760,6 +774,87 @@ static void dtm_static(struct lg1314_drm *lg, int mode)
 		hdr_put_hlg_static(lg, mode);
 }
 
+bool lg1314_hdr_hdr10plus_on(struct lg1314_drm *lg)
+{
+	return READ_ONCE(lg->hdr.hdr10) && READ_ONCE(lg->hdr.h10p_active) &&
+	       READ_ONCE(hdr_hdr10plus) && !READ_ONCE(lg->dovi.active);
+}
+
+void lg1314_hdr_hdr10plus_shown(struct lg1314_drm *lg,
+				const struct lg1314_hdr10plus *md)
+{
+	bool kick = false, status = false;
+
+	mutex_lock(&lg->hdr.lock);
+	if (md) {
+		lg->hdr.h10p_missing = 0;
+		if (!lg->hdr.h10p_active || memcmp(md, &lg->hdr.h10p, sizeof(*md))) {
+			status = !lg->hdr.h10p_active;
+			lg->hdr.h10p = *md;
+			lg->hdr.h10p_active = true;
+			lg->hdr.h10p_seq++;
+			kick = true;
+		}
+	} else if (lg->hdr.h10p_active &&
+		   ++lg->hdr.h10p_missing > H10P_MISSING_MAX) {
+		lg->hdr.h10p_active = false;
+		kick = status = true;
+	}
+	mutex_unlock(&lg->hdr.lock);
+	if (kick)
+		lg1314_hdr_kick(lg);
+	if (status)
+		lg1314_status_update(lg);
+}
+
+void lg1314_hdr_hdr10plus_reset(struct lg1314_drm *lg)
+{
+	bool was;
+
+	mutex_lock(&lg->hdr.lock);
+	was = lg->hdr.h10p_active;
+	lg->hdr.h10p_active = false;
+	lg->hdr.h10p_missing = 0;
+	mutex_unlock(&lg->hdr.lock);
+	if (was) {
+		lg1314_hdr_kick(lg);
+		lg1314_status_update(lg);
+	}
+}
+
+/* The HDR10+ curve for the metadata on screen into slot B, if not in yet. */
+static void hdr10plus_put(struct lg1314_drm *lg)
+{
+	const struct lg1314_hdr_fw *fw = lg->hdr.fw;
+	struct lg1314_hdr10plus_in in = {
+		.md = lg->hdr.h10p,
+		.panel_nits = clamp(READ_ONCE(hdr10plus_panel), 100u, 10000u),
+		.static_nits = lg->hdr.nits,
+		.pts = TONE_PTS,
+	};
+	u32 x[TONE_PTS], y[TONE_PTS];
+	int i;
+
+	if (lg->hdr.dtm_on && lg->hdr.h10p_done == lg->hdr.h10p_seq)
+		return;
+	for (i = 0; i < TONE_PTS; i++)
+		x[i] = le32_to_cpu(fw->tone_x[i]);
+	in.x = x;
+	kernel_fpu_begin();
+	lg1314_hdr10plus_curve(&in, y);
+	kernel_fpu_end();
+	if (!lg->hdr.dtm_on || READ_ONCE(hdr_dtm_debug))
+		dev_info(lg->dev, "HDR10+: MaxSCL %u/%u/%u, avg %u (0.1 nit), target %u nit, %s%u anchors -> %u..%u\n",
+			 in.md.maxscl[0], in.md.maxscl[1], in.md.maxscl[2],
+			 in.md.avg_maxrgb, in.md.target_nits,
+			 in.md.num_anchors ? "" : "no curve, ", in.md.num_anchors,
+			 y[0], y[TONE_PTS - 1]);
+	hdr_put_tone_y(lg, y);
+	memcpy(lg->hdr.dtm_prev, y, sizeof(y));
+	lg->hdr.dtm_on = true;
+	lg->hdr.h10p_done = lg->hdr.h10p_seq;
+}
+
 static void lg1314_hdr_dtm_work(struct lg1314_drm *lg)
 {
 	const struct lg1314_hdr_fw *fw = lg->hdr.fw;
@@ -774,6 +869,11 @@ static void lg1314_hdr_dtm_work(struct lg1314_drm *lg)
 	hlg = lg->hdr.hlg;
 	if (!fw || READ_ONCE(lg->dovi.active) || (!lg->hdr.hdr10 && !hlg))
 		goto out;
+	if (lg->hdr.hdr10 && lg->hdr.h10p_active && READ_ONCE(hdr_hdr10plus)) {
+		hdr10plus_put(lg);
+		lg->hdr.dtm_reset = true;	/* DTM starts afresh after */
+		goto out;
+	}
 	if (!READ_ONCE(hdr_dtm)) {
 		dtm_static(lg, mode);
 		goto out;
@@ -1108,7 +1208,8 @@ void lg1314_hdr_tick(struct lg1314_drm *lg)
 	bool hlg = READ_ONCE(lg->hdr.hlg) && !READ_ONCE(lg->dovi.active);
 	bool hdr = READ_ONCE(lg->hdr.hdr10) || hlg || READ_ONCE(lg->dovi.active);
 
-	if ((READ_ONCE(lg->hdr.hdr10) && (READ_ONCE(hdr_dtm) || lg->hdr.dtm_on)) ||
+	if ((READ_ONCE(lg->hdr.hdr10) && (READ_ONCE(hdr_dtm) || lg->hdr.dtm_on ||
+					   READ_ONCE(lg->hdr.h10p_active))) ||
 	    (hlg && (READ_ONCE(hdr_dtm) || READ_ONCE(lg->hdr.hlg_static) !=
 		     hlg_static2(clamp(READ_ONCE(hdr_dtm_mode), 0, DTM_MODES - 1)))) ||
 	    (lg->hdr.wcg && READ_ONCE(lg->hdr.wcg_section) !=

@@ -14,7 +14,8 @@
  *   refresh=47.952 Hz		seq=3
  *   seq=7
  *
- * refresh= is the mode's refresh rate, for every mode.
+ * refresh= is the mode's refresh rate, for every mode. An HDR10 stream whose
+ * HDR10+ metadata makes the tone curve has dynamic=hdr10+ after mode=.
  */
 
 #include <linux/device.h>
@@ -68,6 +69,8 @@ static int status_text(struct lg1314_drm *lg, char *buf, size_t n)
 		}
 	} else if (lg->hdr.hdr10) {
 		len += scnprintf(buf + len, n - len, "mode=hdr10\n");
+		if (lg1314_hdr_hdr10plus_on(lg))
+			len += scnprintf(buf + len, n - len, "dynamic=hdr10+\n");
 		if (lg->hdr.mdl_max)
 			len += status_range(buf + len, n - len, "mastering",
 					    lg->hdr.mdl_min, lg->hdr.mdl_max * 10000);

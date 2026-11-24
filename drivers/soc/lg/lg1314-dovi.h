@@ -8,6 +8,7 @@
 
 #include <linux/types.h>
 #include <linux/soc/lg/lg1314-dovi-meta.h>
+#include <linux/soc/lg/lg1314-hdr10plus.h>
 
 #define DOVI_COMP_WORDS		LG1314_DOVI_COMP_WORDS
 #define DOVI_MAX_PIVOTS		9	/* luma; chroma uses at most 5 */
@@ -78,5 +79,9 @@ int dovi_rpu_parse(struct dovi_state *st, const u8 *nal, size_t len,
 /* The composer register image for a picture of @width x @height. */
 void dovi_composer_regs(const struct dovi_rpu *rpu, u32 width, u32 height,
 			u32 regs[DOVI_COMP_WORDS]);
+
+/* HDR10+ metadata in a prefix SEI NAL unit; @scratch holds @len bytes. */
+int hdr10plus_parse_sei(const u8 *nal, size_t len, u8 *scratch,
+			struct lg1314_hdr10plus *md);
 
 #endif

@@ -214,8 +214,26 @@ void lg1314_video_debugfs_init(struct lg1314_drm *lg) { }
 static void video_shown(void *ctx, u32 id)
 {
 	struct lg1314_video *v = ctx;
+	struct lg1314_hdr10plus md;
+	unsigned long flags;
+	int i, found = -1;
 
 	video_trace(v, 's', id, 0);
+	/* HDR10+: the metadata of the picture now on screen */
+	spin_lock_irqsave(&v->h10p_lock, flags);
+	for (i = 0; i < ARRAY_SIZE(v->h10p_q); i++) {
+		if (v->h10p_q[i].id == id && id) {
+			found = v->h10p_q[i].has;
+			if (found)
+				md = v->h10p_q[i].md;
+			v->h10p_q[i].id = 0;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&v->h10p_lock, flags);
+	if (found >= 0)
+		lg1314_hdr_hdr10plus_shown(to_lg1314(v->plane.dev),
+					   found ? &md : NULL);
 	/* The window stays blanked until it has a picture to show. */
 	if (READ_ONCE(v->blanked)) {
 		video_de_blank(to_lg1314(v->plane.dev), false);
@@ -404,6 +422,7 @@ static void video_vo_close(struct lg1314_drm *lg, struct lg1314_video *v)
 	if (v->dovi_profile)
 		lg1314_dovi_stop(lg);
 	v->dovi_profile = 0;
+	lg1314_hdr_hdr10plus_reset(lg);
 }
 
 static void video_atomic_update(struct drm_plane *plane,
@@ -532,6 +551,19 @@ static void video_atomic_update(struct drm_plane *plane,
 		if (v->dovi_pic_valid)
 			lg1314_dovi_queue(lg, lg1314_dovi_pts90(ts), &v->dovi_pic);
 	}
+	/* HDR10+: the picture's metadata, applied once it is on screen */
+	if (!v->dovi_profile) {
+		unsigned long flags;
+		unsigned int k;
+
+		spin_lock_irqsave(&v->h10p_lock, flags);
+		k = v->h10p_head++ % ARRAY_SIZE(v->h10p_q);
+		v->h10p_q[k].id = f.id;
+		v->h10p_q[k].has = dovi == 0 &&
+			!lg1314_vdec_picture_hdr10plus(v->vdec, f.addr_y,
+							&v->h10p_q[k].md);
+		spin_unlock_irqrestore(&v->h10p_lock, flags);
+	}
 	if (video_hold(v, fb, f.id)) {
 		drm_err(plane->dev, "video: too many frames in flight\n");
 		return;
@@ -598,6 +630,7 @@ int lg1314_video_init(struct lg1314_drm *lg)
 
 	mutex_init(&v->held_lock);
 	spin_lock_init(&v->trace_lock);
+	spin_lock_init(&v->h10p_lock);
 	INIT_DELAYED_WORK(&v->calib_work, video_calibrate);
 	v->tick_mhz = 60000;
 	v->rate_mhz = 60000;

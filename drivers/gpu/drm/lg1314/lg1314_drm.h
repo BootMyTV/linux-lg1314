@@ -262,6 +262,15 @@ struct lg1314_video {
 	u64				dovi_last_ts;
 	struct lg1314_dovi_pic		dovi_pic;
 
+	/* HDR10+: the metadata of pictures written, until on screen */
+	spinlock_t			h10p_lock;
+	struct {
+		u32			id;
+		bool			has;
+		struct lg1314_hdr10plus	md;
+	}				h10p_q[8];
+	unsigned int			h10p_head;
+
 	/* frame timing trace (debugfs video_trace): picture written, on
 	 * screen, off screen */
 	spinlock_t			trace_lock;
@@ -358,6 +367,13 @@ struct lg1314_drm {
 		u32			dtm_hist[32];	/* previous histogram */
 		u32			dtm_prev[33];	/* curve last written */
 		u8			dtm_keep;	/* scene change glide left */
+		/* HDR10+: the metadata of the picture on screen; while the
+		 * stream carries it, it makes the curve in slot B */
+		struct lg1314_hdr10plus	h10p;
+		bool			h10p_active;
+		u32			h10p_seq;	/* bumped on new metadata */
+		u32			h10p_done;	/* what slot B's curve is for */
+		unsigned int		h10p_missing;	/* pictures shown without */
 		/* OLED panel boost (the TCON's "module HDR" + boost table) */
 		struct i2c_client	*tcon;	/* NULL: none */
 		u8			boost_dflt[39];	/* the panel's own table */
@@ -433,6 +449,12 @@ void lg1314_hdr_fini(struct lg1314_drm *lg);
 void lg1314_hdr_tick(struct lg1314_drm *lg);
 u32 lg1314_hdr_mode(struct lg1314_drm *lg);
 void lg1314_hdr_kick(struct lg1314_drm *lg);
+/* HDR10+: a picture reached the screen, with metadata or (NULL) without */
+void lg1314_hdr_hdr10plus_shown(struct lg1314_drm *lg,
+				const struct lg1314_hdr10plus *md);
+void lg1314_hdr_hdr10plus_reset(struct lg1314_drm *lg);
+/* HDR10+ makes the HDR10 curve now */
+bool lg1314_hdr_hdr10plus_on(struct lg1314_drm *lg);
 int  lg1314_status_init(struct lg1314_drm *lg);
 void lg1314_status_update(struct lg1314_drm *lg);
 int  lg1314_hdr_init_props(struct lg1314_drm *lg);
