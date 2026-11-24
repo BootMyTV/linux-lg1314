@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* LG1314 OSD0 graphics plane: HW init, scanout header, enable. */
 
+#include <linux/moduleparam.h>
 #include <linux/sizes.h>
 
 #include "lg1314_drm.h"
@@ -11,6 +12,32 @@
 static void osd_rmw(struct lg1314_drm *lg, u32 phys, u32 mask, u32 val)
 {
 	lg1314_wr(lg, phys, (lg1314_rd(lg, phys) & ~mask) | (val & mask));
+}
+
+/*
+ * The SR path's sharpening (SHP) on the upscaled graphics plane: the hardware
+ * has its transient improvement stages and de-jaggy filter on (HTI / VTI gain
+ * 40, LTI 96); they halo text and thin lines. Off unless asked for; a change
+ * applies at the next vsync.
+ */
+static bool osd_sharpen;
+module_param(osd_sharpen, bool, 0644);
+MODULE_PARM_DESC(osd_sharpen, "Sharpen the upscaled graphics plane (the hardware's default; off: as drawn)");
+
+static const u16 shp_stages[] = {
+	SHP_HTI_CTRL_00, SHP_VTI_CTRL_00, SHP_LTI_CTRL_00, SHP_DJ_CTRL_00,
+};
+
+/* The sharpening stages as osd_sharpen says, if not so already. Any context. */
+void lg1314_osd_sharpen_update(struct lg1314_drm *lg)
+{
+	int on = READ_ONCE(osd_sharpen), i;
+
+	if (on == lg->osd_sharpen)
+		return;
+	for (i = 0; i < ARRAY_SIZE(shp_stages); i++)
+		osd_rmw(lg, OSD_SHP_PHYS + shp_stages[i], BIT(0), on);
+	lg->osd_sharpen = on;
 }
 
 /*
@@ -48,6 +75,8 @@ void lg1314_osd_init(struct lg1314_drm *lg)
 	osd_rmw(lg, OSD_SHP_PHYS + SHP_CORE_CTRL_00, SHP_TOP_BYPASS, 0);
 	osd_rmw(lg, OSD_BANK_PHYS + OSD_BITMAP_CTRL0,
 		OSD_SHP_DETOUR_EN | OSD_SR_CSC_EN, OSD_SR_CSC_EN);
+	lg->osd_sharpen = -1;
+	lg1314_osd_sharpen_update(lg);
 }
 
 void lg1314_osd_enable(struct lg1314_drm *lg, bool on)

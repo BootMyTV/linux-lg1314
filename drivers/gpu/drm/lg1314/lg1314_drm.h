@@ -176,6 +176,12 @@ struct lg1314_mmio {
 #define SHP_CORE_CTRL_00		0x00	/* reg_top_bypass = BIT(5) */
 #define SHP_CORE_CTRL_01		0x04	/* reg_top_width[0:11], reg_top_height[16:27] */
 #define SHP_TOP_BYPASS			BIT(5)
+/* SHP sharpening stages, each enabled by bit 0: horizontal, vertical and luma
+ * transient improvement, the de-jaggy edge filter */
+#define SHP_HTI_CTRL_00			0x60
+#define SHP_VTI_CTRL_00			0x90
+#define SHP_LTI_CTRL_00			0xa0
+#define SHP_DJ_CTRL_00			0x100
 #define SHP_SIZE_VAL			((LG1314_PANEL_H << 16) | LG1314_PANEL_W)
 #define OSD_BITMAP_CTRL0		0x258	/* OSD bank; byte at +0x25b */
 #define OSD_SHP_DETOUR_EN		BIT(28)
@@ -202,6 +208,7 @@ struct lg1314_mmio {
 #define DE_IPC_EXT_STATUS		0x10	/* firmware -> host interrupts */
 #define DE_IPC_EXT_CLEAR		0x14
 #define DE_IPC_INT_EVENT		0x18	/* host -> firmware interrupts */
+#define DE_IPC_INT_ENABLE		0x1c	/* the firmware's own: set once it runs */
 #define DE_IPC_MBOX_IRQ			BIT(21)	/* mailbox doorbell, both directions */
 #define DE_IPC_TAG			0x100	/* memory layout table, read by the firmware */
 #define DE_IPC_MBOX_TX			0x100	/* host -> firmware mailbox */
@@ -302,6 +309,7 @@ struct lg1314_drm {
 	/* vblank: every other OSD mixer vsync (panel refresh is twice the mode's) */
 	int				irq;
 	unsigned int			vsync_count;
+	int				osd_sharpen;	/* applied: 0, 1; -1 unknown */
 	bool				video_phase;	/* vblank at video ticks */
 	/* video tick timing, for calibrating the output's rate */
 	unsigned int			tick_n;
@@ -441,6 +449,7 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 		     u32 w, u32 h, bool opaque, bool afbc);
 void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
+void lg1314_osd_sharpen_update(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 struct drm_atomic_state;
 int  lg1314_hdr_setup(struct lg1314_drm *lg);

@@ -252,6 +252,7 @@ static irqreturn_t lg1314_vsync_irq(int irq, void *arg)
 
 	if (!lg1314_osd_vsync_ack(lg))
 		return IRQ_NONE;
+	lg1314_osd_sharpen_update(lg);
 
 	vblank = !READ_ONCE(lg->video_phase) && (++lg->vsync_count & 1);
 	if (vblank)
@@ -790,6 +791,7 @@ static int lg1314_probe(struct platform_device *pdev)
 	lg = devm_drm_dev_alloc(dev, &lg1314_drm_driver, struct lg1314_drm, drm);
 	if (IS_ERR(lg))
 		return PTR_ERR(lg);
+	lg->osd_sharpen = -1;	/* the hardware's: unknown until set */
 	lg->dev = dev;
 	platform_set_drvdata(pdev, lg);
 
@@ -898,8 +900,9 @@ static void lg1314_remove(struct platform_device *pdev)
 	struct lg1314_drm *lg = platform_get_drvdata(pdev);
 
 	drm_dev_unplug(&lg->drm);
-	drm_atomic_helper_shutdown(&lg->drm);
+	/* the timing controller while the panel is still powered */
 	lg1314_hdr_fini(lg);
+	drm_atomic_helper_shutdown(&lg->drm);
 	lg1314_video_fini(lg);
 	if (lg->hdr.tcon)
 		put_device(&lg->hdr.tcon->dev);
@@ -910,8 +913,8 @@ static void lg1314_shutdown(struct platform_device *pdev)
 {
 	struct lg1314_drm *lg = platform_get_drvdata(pdev);
 
-	drm_atomic_helper_shutdown(&lg->drm);
 	lg1314_hdr_fini(lg);
+	drm_atomic_helper_shutdown(&lg->drm);
 }
 
 static const struct of_device_id lg1314_of_match[] = {

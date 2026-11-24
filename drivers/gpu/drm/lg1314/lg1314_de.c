@@ -95,6 +95,20 @@ int lg1314_de_load_fw(struct lg1314_drm *lg)
 	if (lg->de_fw_phys < DE_FW_DDR_MIN || !lg->de_fw_size)
 		return -EINVAL;
 
+	/*
+	 * A firmware already running (this driver loaded before, in this
+	 * boot) is kept: the MCU has no reset we can use (the vendor's is
+	 * compiled out; the CTOP candidates hang the bus), and holding it,
+	 * copying and releasing it lets the old code run on over the new
+	 * image, never taking commands. The vendor's test for a running
+	 * firmware (DE_REG_M19_IPCisAlive): it has enabled its IPC interrupt.
+	 */
+	if (readl(lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_INT_ENABLE) &
+	    DE_IPC_MBOX_IRQ) {
+		dev_info(lg->dev, "DE firmware already running: kept\n");
+		return 0;
+	}
+
 	ret = request_firmware(&fw, DE_FW_NAME, lg->dev);
 	if (ret) {
 		dev_err(lg->dev, "DE firmware %s not found: %d\n", DE_FW_NAME, ret);
