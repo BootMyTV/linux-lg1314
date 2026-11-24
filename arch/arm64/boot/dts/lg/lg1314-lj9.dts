@@ -59,8 +59,12 @@
 		#size-cells = <1>;
 		ranges;
 
-		/* Video decoder: decoded pictures. A CMA area (lent to Linux while
-		 * unused) so the frames can be shared as dma-bufs. */
+		/*
+		 * Video decoder: decoded pictures. A CMA area (lent to Linux while
+		 * unused) so the frames can be shared as dma-bufs. Not below
+		 * 0x4f400000: the "gap" 0x3e400000-0x4f3fffff is the same DRAM as
+		 * 0xaf000000-0xbfffffff (the display regions below), aliased.
+		 */
 		vdec_dpb: vdec-dpb@4f400000 {
 			compatible = "shared-dma-pool";
 			reg = <0x4f400000 0x13c00000>;
@@ -107,9 +111,44 @@
 			no-map;
 		};
 
-		/* Includes the boot firmware's live scanout (framebuffer@78602000). */
-		kdrv-misc@77100000 {
-			reg = <0x77100000 0x08f00000>;
+		/*
+		 * Video decoder: overflow for decoded pictures (and the Dolby
+		 * Vision enhancement layer's), in three pieces around the boot
+		 * scanout and the boot ROM's retention area. The display
+		 * firmware is given their span as its second video pool.
+		 */
+		vdec_shared0: vdec-shared@77100000 {
+			reg = <0x77100000 0x01500000>;
+			no-map;
+		};
+
+		/* The boot firmware's live scanout (framebuffer@78602000). */
+		boot-fb@78600000 {
+			reg = <0x78600000 0x00800000>;
+			no-map;
+		};
+
+		vdec_shared1: vdec-shared@78e00000 {
+			reg = <0x78e00000 0x05ae0000>;
+			no-map;
+		};
+
+		/* The boot firmware's key area (stock "sbkey") and the boot
+		 * ROM's warm-boot word (0x7e8f0000). */
+		boot-retention@7e8e0000 {
+			reg = <0x7e8e0000 0x00020000>;
+			no-map;
+		};
+
+		vdec_shared2: vdec-shared@7e900000 {
+			reg = <0x7e900000 0x00c00000>;
+			no-map;
+		};
+
+		/* Secure firmware (BL31), where the stock one lives. Its first
+		 * 2 MiB are firewalled from the non-secure world. */
+		secure-fw@7f500000 {
+			reg = <0x7f500000 0x00b00000>;
 			no-map;
 		};
 
@@ -142,13 +181,16 @@
 		compatible = "lge,lg1314-drm";
 		memory-region = <&gfx_surface>, <&de_fw>, <&de_fw_m0>, <&de_prew>,
 				<&de_hdr>, <&de_frm>, <&de_vt>, <&kdrv_be>,
-				<&vdec_dpb>;
+				<&vdec_dpb>, <&vdec_shared0>, <&vdec_shared1>,
+				<&vdec_shared2>;
 		memory-region-names = "scanout", "de-fw", "de-fw-m0", "de-prew",
 				      "de-hdr", "de-frm", "de-vt", "be",
-				      "vdec-dpb";
+				      "vdec-dpb", "vdec-shared", "vdec-shared",
+				      "vdec-shared";
 		/* Model word for the DE firmware (from the board's hwopt). */
 		lge,de-model = <0x00020001>;
 		lge,micom = <&micom>;
+		lge,tcon = <&tcon>;
 		lge,vdec = <&vdec>;
 		/* OSD mixer vsync, DE sync pulses (video tick), DE IPC */
 		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
@@ -158,8 +200,9 @@
 
 	vdec: vdec {
 		compatible = "lge,lg1314-vdec";
-		memory-region = <&vdec_mcu>, <&vdec_dpb>;
-		memory-region-names = "mcu", "dpb";
+		memory-region = <&vdec_mcu>, <&vdec_dpb>, <&vdec_shared0>,
+				<&vdec_shared1>, <&vdec_shared2>;
+		memory-region-names = "mcu", "dpb", "shared", "shared", "shared";
 		interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
 	};
 };
@@ -168,6 +211,14 @@
 	micom: micom@29 {
 		compatible = "lge,lg1314-micom";
 		reg = <0x29>;
+	};
+};
+
+/* The OLED panel's timing controller (16-bit register addresses). */
+&tcon_i2c {
+	tcon: tcon@70 {
+		compatible = "lge,lg1314-tcon";
+		reg = <0x70>;
 	};
 };
 

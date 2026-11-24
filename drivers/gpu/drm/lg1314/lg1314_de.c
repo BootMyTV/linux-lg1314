@@ -75,6 +75,11 @@ static void lg1314_de_write_tag(struct lg1314_drm *lg)
 		t.vdec_pool_0 = (struct de_tag_mem){ dpb, dpb_size + surf_size };
 	else
 		t.vdec_pool_0 = (struct de_tag_mem){ surf, dpb - surf + dpb_size };
+	/* The firmware takes video (and Dolby Vision enhancement layer)
+	 * pictures only from these spans: the second is the decoder's
+	 * overflow pool, as stock's for its high-frame-rate pool. */
+	if (m->vdec_shared.end)
+		t.vdec_pool_1 = de_mem(&m->vdec_shared);
 
 	memcpy_toio(lg->mmio[LG1314_REG_DE_IPC].virt + DE_IPC_TAG, &t, sizeof(t));
 	wmb();

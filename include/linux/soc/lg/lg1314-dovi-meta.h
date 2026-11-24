@@ -98,6 +98,9 @@ struct lg1314_dovi_pic {
 	u32			comp[LG1314_DOVI_COMP_WORDS];
 	bool			dm_valid;	/* a DM header was seen */
 	struct lg1314_dovi_dm	dm;
+	/* profile 7 with a full enhancement layer: its picture (el_y 0: none) */
+	u32			el_y, el_c, el_stride;
+	u32			el_size;	/* width << 16 | height */
 };
 
 #endif

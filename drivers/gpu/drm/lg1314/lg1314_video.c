@@ -519,6 +519,16 @@ static void video_atomic_update(struct drm_plane *plane,
 		 * (its RPU unusable) gets the previous picture's metadata */
 		if (dovi > 0)
 			v->dovi_pic_valid = true;
+		/* profile 7: its enhancement layer picture, if the decoder has
+		 * it (only for its own record: the residual is the picture's) */
+		if (dovi > 0 && v->dovi_pic.el_y) {
+			f.el_y = v->dovi_pic.el_y;
+			f.el_c = v->dovi_pic.el_c;
+			f.el_stride = v->dovi_pic.el_stride;
+			f.el_size = v->dovi_pic.el_size;
+		} else if (dovi <= 0) {
+			v->dovi_pic.comp[0] = 1;	/* no residual */
+		}
 		if (v->dovi_pic_valid)
 			lg1314_dovi_queue(lg, lg1314_dovi_pts90(ts), &v->dovi_pic);
 	}

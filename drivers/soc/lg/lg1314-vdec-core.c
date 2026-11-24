@@ -105,6 +105,8 @@ static struct lg1314_vdec *vdec_instance;
  */
 #define VDEC_CPB_POOL_SIZE	0x01800000
 #define VDEC_HMA_ORDER		12	/* allocation granule: 4 KiB */
+/* "shared" regions: no-map memory the dpb pool overflows into */
+#define VDEC_SHARED_MAX		4
 #define VDEC_BOOTPARAM_MAX	512
 #define VDEC_CMDLINE \
 	"console=ttyAMA0,115200n81 console=ttyIPC root=mtd1 quiet " \
@@ -254,6 +256,7 @@ struct lg1314_vdec {
 
 	struct gen_pool		*hma_vdec;	/* firmware buffer pools (phys) */
 	struct gen_pool		*hma_cpb;
+	struct gen_pool		*hma_shared;	/* dpb overflow (no-map), or NULL */
 	struct list_head	hma_allocs;	/* live allocations, for frees */
 	struct mutex		hma_lock;
 	/* A decoded picture's key goes to the video output only while its
@@ -270,6 +273,8 @@ struct lg1314_vdec {
 
 	struct resource		mcu_mem;	/* cpb pool, IPC area, ROM, vdec pool */
 	struct resource		dpb_mem;	/* decoded pictures */
+	struct resource		shared_mem[VDEC_SHARED_MAX];	/* dpb overflow */
+	unsigned int		n_shared;
 	phys_addr_t		ipc_phys;	/* IPC area ("param_base") */
 	phys_addr_t		rom_phys;	/* firmware image */
 	void __iomem		*rom;		/* ROM region (image + bootparam) */
@@ -485,7 +490,7 @@ static void vdec_call_returned(struct lg1314_vdec *v, u32 ipc_number, int ret)
 struct vdec_hma_alloc {
 	struct list_head	list;
 	struct gen_pool		*pool;	/* NULL: from the dpb CMA area (DMA API) */
-	void			*vaddr;	/* dpb: cached kernel mapping */
+	void			*vaddr;	/* dpb: kernel mapping (overflow pool: WC) */
 	void			*lent;	/* dpb: a decoder's output buffer instead */
 	u32			phys;
 	u32			size;
@@ -557,12 +562,20 @@ static bool vdec_in(const struct resource *r, phys_addr_t phys, size_t size)
 /* The firmware's memory: its own regions and the buffers it is given. */
 bool lg1314_vdec_in_carveout(struct lg1314_vdec *v, phys_addr_t phys, size_t size)
 {
-	return vdec_in(&v->mcu_mem, phys, size) || vdec_in(&v->dpb_mem, phys, size);
+	unsigned int i;
+
+	if (vdec_in(&v->mcu_mem, phys, size) || vdec_in(&v->dpb_mem, phys, size))
+		return true;
+	for (i = 0; i < v->n_shared; i++)
+		if (vdec_in(&v->shared_mem[i], phys, size))
+			return true;
+	return false;
 }
 
 /*
  * Kernel mapping of [phys, phys + len) inside a dpb-pool buffer (a decoded
- * frame), made coherent for CPU reads. NULL if it isn't one.
+ * frame), made coherent for CPU reads: cached from the CMA area, uncached
+ * from the overflow pool. NULL if it isn't one.
  */
 const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 				  size_t len)
@@ -572,10 +585,12 @@ const void *lg1314_vdec_frame_map(struct lg1314_vdec *v, phys_addr_t phys,
 
 	mutex_lock(&v->hma_lock);
 	list_for_each_entry(a, &v->hma_allocs, list) {
-		if (a->pool || a->lent || phys < a->phys || phys - a->phys >= a->size ||
+		if ((a->pool && a->pool != v->hma_shared) || a->lent ||
+		    phys < a->phys || phys - a->phys >= a->size ||
 		    len > a->size - (phys - a->phys))
 			continue;
-		dma_sync_single_for_cpu(v->dev, phys, len, DMA_FROM_DEVICE);
+		if (!a->pool)
+			dma_sync_single_for_cpu(v->dev, phys, len, DMA_FROM_DEVICE);
 		p = a->vaddr + (phys - a->phys);
 		break;
 	}
@@ -653,8 +668,40 @@ static unsigned long vdec_hma_alloc_dpb(struct lg1314_vdec *v,
 	return dma;
 }
 
+/*
+ * The dpb pool's overflow: no-map memory, so mapped write-combined, for the
+ * rare picture the CPU copies out. Sets a->pool. The display firmware must be
+ * told about it too (its second video pool), or it won't show pictures from
+ * it.
+ */
+static unsigned long vdec_hma_alloc_shared(struct lg1314_vdec *v,
+					   struct vdec_hma_alloc *a, u32 size,
+					   u32 align, const char *name)
+{
+	struct genpool_data_align data = { .align = max(align, 1u) };
+	unsigned long phys;
+
+	phys = gen_pool_alloc_algo(v->hma_shared, size, gen_pool_first_fit_align, &data);
+	if (!phys)
+		return 0;
+	a->vaddr = memremap(phys, size, MEMREMAP_WC);
+	if (!a->vaddr) {
+		gen_pool_free(v->hma_shared, phys, size);
+		return 0;
+	}
+	/* Zeroed, as from the CMA area: the firmware doesn't write every part
+	 * of a picture buffer. */
+	memset(a->vaddr, 0, size);
+	a->pool = v->hma_shared;
+	dev_dbg(v->dev, "hma: %u bytes for \"%s\" from the overflow pool at %#lx\n",
+		size, name, phys);
+	return phys;
+}
+
 static void vdec_hma_free_one(struct lg1314_vdec *v, struct vdec_hma_alloc *a)
 {
+	if (a->vaddr && a->pool)
+		memunmap(a->vaddr);
 	if (a->pool)
 		gen_pool_free(a->pool, a->phys, a->size);
 	else if (a->lent)
@@ -751,6 +798,8 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 			phys = vdec_hma_alloc_dpb(v, a, size, align);
 			size = max(size, align);
 		}
+		if (!phys && v->hma_shared)
+			phys = vdec_hma_alloc_shared(v, a, size, align, name);
 	}
 	if (!phys) {
 		dev_warn_ratelimited(v->dev, "hma: out of memory for %u bytes (align %#x) in %s for \"%s\"\n",
@@ -764,7 +813,8 @@ static u32 vdec_hma_alloc(struct lg1314_vdec *v, struct gen_pool *pool,
 			lg1314_vdec_dec_dpb_failed(v->dec);
 		return 0;
 	}
-	a->pool = pool;
+	if (pool)
+		a->pool = pool;	/* else NULL, or the overflow pool */
 	a->phys = phys;
 	a->size = size;
 	mutex_lock(&v->hma_lock);
@@ -1484,6 +1534,55 @@ static struct gen_pool *vdec_pool_create(struct device *dev, int order,
 	return ret ? ERR_PTR(ret) : pool;
 }
 
+/*
+ * The dpb pool's overflow: every memory-region named "shared" (no-map
+ * memory, possibly in pieces), one allocator. Optional.
+ */
+static int vdec_shared_init(struct lg1314_vdec *v)
+{
+	struct device *dev = v->dev;
+	struct device_node *np;
+	struct resource *r;
+	int n, i, ret;
+
+	n = of_property_count_strings(dev->of_node, "memory-region-names");
+	for (i = 0; i < n; i++) {
+		const char *name;
+
+		if (of_property_read_string_index(dev->of_node, "memory-region-names",
+						  i, &name) || strcmp(name, "shared"))
+			continue;
+		if (v->n_shared == VDEC_SHARED_MAX)
+			return dev_err_probe(dev, -EINVAL, "too many shared regions\n");
+		r = &v->shared_mem[v->n_shared];
+		np = of_parse_phandle(dev->of_node, "memory-region", i);
+		if (!np)
+			return dev_err_probe(dev, -EINVAL, "bad shared memory region\n");
+		ret = of_address_to_resource(np, 0, r);
+		of_node_put(np);
+		if (ret)
+			return ret;
+		if (r->start < VDEC_DATA0_PHYS || r->end >= VDEC_DATA_END)
+			return dev_err_probe(dev, -EINVAL, "shared region %pR outside the coprocessor's data windows\n", r);
+		if (!v->hma_shared) {
+			v->hma_shared = vdec_pool_create(dev, VDEC_HMA_ORDER, r->start,
+							 r->start, resource_size(r));
+			if (IS_ERR(v->hma_shared))
+				return PTR_ERR(v->hma_shared);
+		} else {
+			ret = gen_pool_add_virt(v->hma_shared, r->start, r->start,
+						resource_size(r), NUMA_NO_NODE);
+			if (ret)
+				return ret;
+		}
+		v->n_shared++;
+	}
+	if (v->hma_shared)
+		dev_info(dev, "dpb overflow: %zu MiB in %u regions\n",
+			 gen_pool_size(v->hma_shared) >> 20, v->n_shared);
+	return 0;
+}
+
 /* Give back every buffer the firmware still holds (module unload). */
 static void vdec_hma_release_all(struct lg1314_vdec *v)
 {
@@ -1569,6 +1668,9 @@ static int lg1314_vdec_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot use the dpb region\n");
 	ret = devm_add_action_or_reset(dev, vdec_release_rmem, dev);
+	if (ret)
+		return ret;
+	ret = vdec_shared_init(v);
 	if (ret)
 		return ret;
 

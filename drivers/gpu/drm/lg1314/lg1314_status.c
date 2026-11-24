@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * What the panel is showing, for userspace: the device's video_mode
- * attribute, "key=value" lines. mode= (sdr, hdr10, dolby) comes first and
+ * attribute, "key=value" lines. mode= (sdr, hdr10, hlg, dolby) comes first and
  * seq= (counts changes) last; userspace polls for POLLPRI, the attribute is
  * notified whenever the text changes.
  *
@@ -78,6 +78,8 @@ static int status_text(struct lg1314_drm *lg, char *buf, size_t n)
 			len += scnprintf(buf + len, n - len, "maxfall=%u cd/m2\n",
 					 lg->hdr.max_fall);
 		len += scnprintf(buf + len, n - len, "tonemap=%u cd/m2\n", lg->hdr.nits);
+	} else if (lg->hdr.hlg) {
+		len += scnprintf(buf + len, n - len, "mode=hlg\n");
 	} else {
 		len += scnprintf(buf + len, n - len, "mode=sdr\n");
 	}

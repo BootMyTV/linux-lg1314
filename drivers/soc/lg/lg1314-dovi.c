@@ -187,6 +187,14 @@ static int rpu_parse_mapping(struct dovi_state *st, struct bitreader *b,
 			m->pivot[c][i] = acc;
 		}
 	}
+	/* profile 7: the residual's dequantisation, linear dead zone only */
+	m->nlq = !(st->rpu_format & 0x700) && !st->disable_residual;
+	if (m->nlq) {
+		if (br_bits(b, 3) != 0)		/* nlq_method_idc */
+			return -EOPNOTSUPP;
+		for (i = 0; i < 2; i++)
+			m->nlq_pivot[i] = br_bits(b, st->bl_bit_depth);
+	}
 	br_ue(b);				/* num_x_partitions_minus1 */
 	br_ue(b);				/* num_y_partitions_minus1 */
 	for (c = 0; c < 3; c++) {
@@ -208,7 +216,31 @@ static int rpu_parse_mapping(struct dovi_state *st, struct bitreader *b,
 				return ret;
 		}
 	}
+	if (m->nlq) {
+		for (c = 0; c < 3; c++) {
+			m->nlq_offset[c] = br_bits(b, st->el_bit_depth);
+			m->nlq_in_max_int[c] = br_ue(b);
+			m->nlq_in_max[c] = br_bits(b, st->coef_log2_denom);
+			m->nlq_slope_int[c] = br_ue(b);
+			m->nlq_slope[c] = br_bits(b, st->coef_log2_denom);
+			m->nlq_threshold_int[c] = br_ue(b);
+			m->nlq_threshold[c] = br_bits(b, st->coef_log2_denom);
+		}
+	}
 	return b->err ? -EINVAL : 0;
+}
+
+/* A minimal enhancement layer: its residual dequantises to zero. */
+static bool rpu_nlq_is_mel(const struct dovi_mapping *m)
+{
+	int c;
+
+	for (c = 0; c < 3; c++)
+		if (m->nlq_offset[c] || m->nlq_in_max_int[c] != 1 || m->nlq_in_max[c] ||
+		    m->nlq_slope_int[c] || m->nlq_slope[c] ||
+		    m->nlq_threshold_int[c] || m->nlq_threshold[c])
+			return false;
+	return true;
 }
 
 static void br_align(struct bitreader *b)
@@ -454,8 +486,8 @@ int dovi_rpu_parse(struct dovi_state *st, const u8 *nal, size_t len,
 	else if (st->vdr_rpu_profile == 1)
 		rpu->profile = st->el_spatial_resampling && !st->disable_residual ?
 			       (st->vdr_bit_depth == 12 ? 7 : 4) : 8;
-	/* single layer only: no enhancement layer to compose */
-	if (!rpu->profile || !st->disable_residual)
+	/* with an enhancement layer: profile 7 only */
+	if (!rpu->profile || (!st->disable_residual && rpu->profile != 7))
 		return -EOPNOTSUPP;
 
 	if (use_prev) {
@@ -489,6 +521,7 @@ int dovi_rpu_parse(struct dovi_state *st, const u8 *nal, size_t len,
 	rpu->coef_log2_denom = st->coef_log2_denom;
 	rpu->disable_residual = st->disable_residual;
 	rpu->map = &st->map[id];
+	rpu->el_mel = rpu->map->nlq && rpu_nlq_is_mel(rpu->map);
 	rpu->dm = st->dm_valid ? &st->dm : NULL;
 	return 0;
 }
@@ -509,24 +542,43 @@ void dovi_composer_regs(const struct dovi_rpu *rpu, u32 width, u32 height,
 			u32 regs[DOVI_COMP_WORDS])
 {
 	static const struct {
-		u8 idc, npiv, piv, ord, poly, pieces, mmr, mmr_ord;
+		u8 idc, npiv, piv, ord, poly, pieces, mmr, mmr_ord, nlq;
 	} lay[3] = {
-		{ 0,   4,   5,   10,  11,  8, 0,   0   },	/* Y */
-		{ 39,  40,  41,  44,  45,  4, 57,  101 },	/* U */
-		{ 106, 107, 108, 111, 112, 4, 124, 168 },	/* V */
+		{ 0,   4,   5,   10,  11,  8, 0,   0,   35  },	/* Y */
+		{ 39,  40,  41,  44,  45,  4, 57,  101, 102 },	/* U */
+		{ 106, 107, 108, 111, 112, 4, 124, 168, 169 },	/* V */
 	};
 	const struct dovi_mapping *m = rpu->map;
 	u8 d = rpu->coef_log2_denom;
 	int c, i, k;
 
 	memset(regs, 0, DOVI_COMP_WORDS * sizeof(u32));
-	regs[0] = rpu->disable_residual;
+	/*
+	 * No residual unless the picture comes with its enhancement layer's
+	 * (the decoder clears it then): profile 7 otherwise composes its base
+	 * layer alone (exact for a minimal EL).
+	 */
+	regs[0] = 1;
 	regs[1] = width | height << 13;
 	regs[2] = rpu->bl_bit_depth | rpu->el_bit_depth << 4 |
 		  rpu->vdr_bit_depth << 8;
 	regs[3] = d;
 
 	for (c = 0; c < 3; c++) {
+		/*
+		 * The residual's dequantisation: offset, then (int << denom |
+		 * frac, 24 bits) the dead zone's slope, vdr_in_max, the dead
+		 * zone's threshold. Used once word 0 says so (an EL picture).
+		 */
+		if (m->nlq) {
+			regs[lay[c].nlq] = m->nlq_offset[c];
+			regs[lay[c].nlq + 1] = ((u64)m->nlq_slope_int[c] << d |
+						m->nlq_slope[c]) & 0xffffff;
+			regs[lay[c].nlq + 2] = ((u64)m->nlq_in_max_int[c] << d |
+						m->nlq_in_max[c]) & 0xffffff;
+			regs[lay[c].nlq + 3] = ((u64)m->nlq_threshold_int[c] << d |
+						m->nlq_threshold[c]) & 0xffffff;
+		}
 		if (c)
 			regs[lay[c].idc] = m->mapping_idc[c];
 		regs[lay[c].npiv] = m->num_pivots[c];

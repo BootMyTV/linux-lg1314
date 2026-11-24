@@ -25,10 +25,22 @@ struct dovi_mapping {
 	u8	mmr_order[2];			/* chroma: 1..3 */
 	s32	mmr_int[2][DOVI_MMR_COEFS];
 	u32	mmr_frac[2][DOVI_MMR_COEFS];
+	/*
+	 * Profile 7: the enhancement layer's residual, linear dead-zone
+	 * dequantisation (NLQ), per component. Coefficients as int + frac
+	 * (coef_log2_denom bits).
+	 */
+	bool	nlq;
+	u16	nlq_pivot[2];			/* BL code values */
+	u16	nlq_offset[3];			/* EL code value */
+	u32	nlq_in_max_int[3], nlq_in_max[3];
+	u32	nlq_slope_int[3], nlq_slope[3];
+	u32	nlq_threshold_int[3], nlq_threshold[3];
 };
 
 struct dovi_rpu {
-	u8	profile;			/* 5, 8 (single layer) */
+	u8	profile;			/* 5, 8 (single layer), 7 (base + enhancement layer) */
+	bool	el_mel;				/* 7: a minimal EL (the residual is zero) */
 	u8	vdr_bit_depth, bl_bit_depth, el_bit_depth;
 	u8	coef_log2_denom;
 	bool	disable_residual;

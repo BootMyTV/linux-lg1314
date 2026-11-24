@@ -235,21 +235,23 @@ int lg1314_dovi_start(struct lg1314_drm *lg, unsigned int profile)
 		WRITE_ONCE(lg->dovi.active, false);
 	else
 		dev_info(lg->dev, "Dolby Vision: on\n");
+	lg1314_hdr_kick(lg);
 	lg1314_status_update(lg);
 	return ret;
 }
 
-/* The stream ends: the DE back to the HDR mode the HDR10 side has set. */
+/* The stream ends: the DE back to the HDR mode the HDR10 / HLG side has set. */
 void lg1314_dovi_stop(struct lg1314_drm *lg)
 {
 	if (!READ_ONCE(lg->dovi.active))
 		return;
 	WRITE_ONCE(lg->dovi.active, false);
-	dovi_set_mode(lg, lg->hdr.hdr10 ? DE_HDR_MODE_HDR10 : DE_HDR_MODE_OFF);
+	dovi_set_mode(lg, lg1314_hdr_mode(lg));
 	dev_info(lg->dev, "Dolby Vision: off (%u requests without a record; pictures: %u DM4, %u DM3; scenes: %u ready, %u computed when queued, slowest %llu us)\n",
 		 lg->dovi.misses, lg->dovi.dm->pics[0], lg->dovi.dm->pics[1],
 		 lg->dovi.dm->ready, lg->dovi.dm->late,
 		 div_u64(lg->dovi.dm->max_ns, 1000));
+	lg1314_hdr_kick(lg);
 	lg1314_status_update(lg);
 }
 

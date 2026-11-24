@@ -25,6 +25,8 @@ struct drm_pending_vblank_event;
 struct lg1314_vdec;
 struct lg1314_vdec_vo;
 struct lg1314_hdr_fw;
+struct lg1314_hdr_hlg;
+struct lg1314_hdr_tf;
 struct lg1314_dovi_dm_state;
 
 #define LG1314_STATUS_LEN	512
@@ -314,6 +316,8 @@ struct lg1314_drm {
 		struct resource		be;	/* back end */
 		struct resource		vdec_dpb;
 		struct resource		scanout;
+		/* the decoder's overflow pool, as one span (end 0: none) */
+		struct resource		vdec_shared;
 		u32			model;
 	} de_mem;
 
@@ -329,13 +333,44 @@ struct lg1314_drm {
 	/* HDR10 (lg1314_hdr.c) */
 	struct {
 		const struct lg1314_hdr_fw *fw;	/* NULL: no HDR10 */
+		const struct lg1314_hdr_hlg *hlg_fw;	/* in fw */
+		const struct lg1314_hdr_tf *tf;		/* computed transfer functions */
 		void __iomem		*area;	/* table area for the DE firmware */
 		u32			nits;	/* peak the tone map is for */
 		u32			mdl_min;	/* the stream's: 1/10000 cd/m² */
 		u16			mdl_max, max_cll, max_fall;	/* cd/m² */
 		bool			hdr10;
+		bool			hlg;
+		s8			hlg_static;	/* slot A: static curve 0 / 1 (cinema), -1 dynamic */
+		u32			sat[32];	/* saturation histogram (OLED adjust) */
+		bool			sat_ok, sat_req, dtm_adj;
+		unsigned long		adj_logged;
 		bool			applied;
 		u32			blob_id;
+		struct mutex		lock;	/* the tone slot */
+		/* dynamic tone mapping (lg1314_hdr.c, per video tick) */
+		struct work_struct	dtm_work;
+		bool			dtm_on;	/* slot B holds a dynamic curve */
+		bool			dtm_reset;	/* new stream: start afresh */
+		int			dtm_mode;	/* table of the curve in use */
+		u32			dtm_level;	/* detected peak, PQ code */
+		u32			dtm_peak[3];	/* last three detections */
+		u32			dtm_hist[32];	/* previous histogram */
+		u32			dtm_prev[33];	/* curve last written */
+		u8			dtm_keep;	/* scene change glide left */
+		/* OLED panel boost (the TCON's "module HDR" + boost table) */
+		struct i2c_client	*tcon;	/* NULL: none */
+		u8			boost_dflt[39];	/* the panel's own table */
+		bool			boost_dflt_ok;
+		int			boost_level;	/* applied; -1 unknown */
+		int			boost_shown;	/* last logged */
+		unsigned long		boost_retry;	/* jiffies: not before */
+		/* the back end's 3D LUT (L3D), loaded by the DE firmware */
+		const u8		*wcg;	/* packed image (hdr.bin v3) */
+		u32			wcg_size;
+		bool			wcg_loaded;
+		int			wcg_section;	/* in use; -1 off, -2 unknown */
+		unsigned long		wcg_retry;	/* jiffies: not before */
 	} hdr;
 
 	/* Dolby Vision (lg1314_dovi.c) */
@@ -392,7 +427,12 @@ void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 struct drm_atomic_state;
+int  lg1314_hdr_setup(struct lg1314_drm *lg);
 void lg1314_hdr_init(struct lg1314_drm *lg);
+void lg1314_hdr_fini(struct lg1314_drm *lg);
+void lg1314_hdr_tick(struct lg1314_drm *lg);
+u32 lg1314_hdr_mode(struct lg1314_drm *lg);
+void lg1314_hdr_kick(struct lg1314_drm *lg);
 int  lg1314_status_init(struct lg1314_drm *lg);
 void lg1314_status_update(struct lg1314_drm *lg);
 int  lg1314_hdr_init_props(struct lg1314_drm *lg);

@@ -183,9 +183,11 @@ enum { FW_PIC_I, FW_PIC_P, FW_PIC_B };
 #define FW_ADD_FLAGS		_IO(FW_IOC_TYPE, 49)
 #define FW_FLAG_DOLBY_VISION	BIT(11)
 #define FW_FLAG_DOVI_BL		BIT(14)	/* the stream is Dolby Vision's base layer */
+#define FW_FLAG_DOVI_EL		BIT(15)	/* ... its enhancement layer */
 
 #define DEC_DOVI_RING		64	/* access units' composer images kept */
 #define DEC_DOVI_RPU_MAX	SZ_64K
+#define DEC_EL_AU_MAX		SZ_2M	/* an access unit's enhancement layer */
 #define FW_EOS			_IO(FW_IOC_TYPE, 47)
 
 #define FW_CODEC_H264		0
@@ -261,6 +263,28 @@ static atomic_t dec_dpb_asked = ATOMIC_INIT(0), dec_dpb_refused = ATOMIC_INIT(0)
 
 MODULE_PARM_DESC(zerocopy, "decode into CAPTURE buffers (else copy pictures into them)");
 
+/* Dolby Vision profile 7 with a full enhancement layer: decode it too. */
+static bool dec_dovi_el = true;
+module_param_named(dovi_el, dec_dovi_el, bool, 0644);
+MODULE_PARM_DESC(dovi_el, "decode Dolby Vision profile 7's full enhancement layer (read at stream start)");
+
+/* Debugging: a wrong residual offset (0), to see the residual is applied. */
+static bool dec_dovi_nlq_test;
+module_param_named(dovi_nlq_test, dec_dovi_nlq_test, bool, 0644);
+MODULE_PARM_DESC(dovi_nlq_test, "debug: compose profile 7 with NLQ offset 0 (a visibly wrong residual)");
+
+/* HEVC CAPTURE buffers: at least this many, and the stream's DPB plus this
+ * (read at a geometry change); access units queued in the firmware. */
+static unsigned int dec_hevc_pics_min = DEC_HEVC_PICS_MIN;
+module_param_named(hevc_pics_min, dec_hevc_pics_min, uint, 0644);
+MODULE_PARM_DESC(hevc_pics_min, "HEVC: CAPTURE buffers at least");
+static unsigned int dec_hevc_pics_extra = DEC_FW_PICS_EXTRA + 1;
+module_param_named(hevc_pics_extra, dec_hevc_pics_extra, uint, 0644);
+MODULE_PARM_DESC(hevc_pics_extra, "HEVC: CAPTURE buffers beyond the stream's DPB");
+static unsigned int dec_fw_queue = DEC_FW_QUEUE;
+module_param_named(fw_queue, dec_fw_queue, uint, 0644);
+MODULE_PARM_DESC(fw_queue, "access units queued in the firmware at most");
+
 struct dec_ctx {
 	struct v4l2_fh		fh;
 	struct lg1314_vdec_dec	*dec;
@@ -327,6 +351,32 @@ struct dec_ctx {
 		u8		profile;
 		struct lg1314_dovi_pic pic;
 	}			*dovi_pics;	/* DEC_DOVI_RING */
+
+	/*
+	 * Profile 7 with a full enhancement layer (FEL): a second firmware
+	 * session decodes it (its NAL units, type 63, without their own NAL
+	 * header), each picture kept by its access unit's uid. Its pictures
+	 * stay in the firmware's own memory.
+	 */
+	bool			want_el;
+	struct dec_el {
+		u32		handle;		/* 0: none */
+		void		*noti;
+		u32		noti_size;
+		void		*cpb;
+		u32		cpb_size;
+		u8		*au;		/* DEC_EL_AU_MAX */
+		/* its pictures by uid (DEC_DOVI_RING; dec_dpb_lock), held
+		 * until their base layer picture goes back to the firmware */
+		struct dec_el_pic {
+			s64	uid;		/* -1: none */
+			u32	addr_y, addr_c, stride, size;
+		}		*pics;
+		unsigned int	fed, skipped, decoded, errors, attached;
+		/* lookups without one: not decoded yet / slot reused */
+		unsigned int	miss_early, miss_late;
+		bool		logged;
+	}			el;
 
 	struct work_struct	noti_work;
 	struct delayed_work	retry_work;	/* input queue full */
@@ -793,7 +843,8 @@ static int dec_find_sps(const u8 *data, size_t size, bool hevc,
 /* ---- firmware calls ---- */
 
 /* An ioctl on the instance's firmware decoder; returns the firmware's result. */
-static int dec_fw_ioctl(struct dec_ctx *ctx, u32 cmd, u32 arg, void *data)
+static int dec_fw_ioctl_h(struct dec_ctx *ctx, u32 handle, u32 cmd, u32 arg,
+			  void *data)
 {
 	u32 size = _IOC_SIZE(cmd);
 	unsigned int dir = VDEC_CALL_WR;
@@ -810,7 +861,7 @@ static int dec_fw_ioctl(struct dec_ctx *ctx, u32 cmd, u32 arg, void *data)
 	if (size && (_IOC_DIR(cmd) & _IOC_READ))
 		dir |= VDEC_CALL_RD;
 
-	ret = lg1314_vdec_call(ctx->dec->v, VDEC_CALL_VDEC_IOCTL, ctx->handle,
+	ret = lg1314_vdec_call(ctx->dec->v, VDEC_CALL_VDEC_IOCTL, handle,
 			       buf, 2 * sizeof(u32) + size, dir, &result);
 	if (!ret && size && (_IOC_DIR(cmd) & _IOC_READ))
 		memcpy(data, buf + 2, size);
@@ -818,11 +869,19 @@ static int dec_fw_ioctl(struct dec_ctx *ctx, u32 cmd, u32 arg, void *data)
 	return ret ?: result;
 }
 
+static int dec_fw_ioctl(struct dec_ctx *ctx, u32 cmd, u32 arg, void *data)
+{
+	return dec_fw_ioctl_h(ctx, ctx->handle, cmd, arg, data);
+}
+
+static void dec_el_close(struct dec_ctx *ctx);
+
 static void dec_session_close(struct dec_ctx *ctx)
 {
 	struct dec_frame *f, *tmp;
 	int result;
 
+	dec_el_close(ctx);
 	if (!ctx->handle)
 		return;
 	list_for_each_entry_safe(f, tmp, &ctx->pending, list) {
@@ -852,6 +911,267 @@ static void *dec_map_ring(struct dec_ctx *ctx, phys_addr_t phys, u32 size)
 	if (!phys || !size || !lg1314_vdec_in_carveout(ctx->dec->v, phys, size))
 		return NULL;
 	return memremap(phys, size, MEMREMAP_WC);
+}
+
+/* ---- Dolby Vision profile 7: the enhancement layer's session ---- */
+
+static u32 dec_nal_sizes(const u8 *data, u32 size, u32 *sizes);
+static s64 dec_picture_uid(struct dec_ctx *ctx, const struct fw_decoded *d);
+
+static void dec_el_close(struct dec_ctx *ctx)
+{
+	struct dec_el *el = &ctx->el;
+	int result;
+
+	if (!el->handle)
+		return;
+	if (el->pics) {
+		spin_lock(&dec_dpb_lock);
+		for (result = 0; result < DEC_DOVI_RING; result++)
+			el->pics[result].uid = -1;
+		spin_unlock(&dec_dpb_lock);
+	}
+	if (el->noti)
+		memunmap(el->noti);
+	if (el->cpb)
+		memunmap(el->cpb);
+	el->noti = el->cpb = NULL;
+	lg1314_vdec_call(ctx->dec->v, VDEC_CALL_VDEC_CLOSE, el->handle, NULL, 0, 0,
+			 &result);
+	dev_info(ctx->dec->dev, "ctx %p: enhancement layer: %u fed, %u skipped, %u pictures, %u with errors, %u shown with theirs, %u without (%u not decoded yet, %u reused)\n",
+		 ctx, el->fed, el->skipped, el->decoded, el->errors, el->attached,
+		 el->miss_early + el->miss_late, el->miss_early, el->miss_late);
+	WRITE_ONCE(el->handle, 0);
+}
+
+static int dec_el_open(struct dec_ctx *ctx)
+{
+	struct lg1314_vdec *v = ctx->dec->v;
+	struct dec_el *el = &ctx->el;
+	struct fw_buffer_info info;
+	s32 memfmt = FW_MEMFMT_TILED;
+	int ret, handle;
+
+	if (!el->au) {
+		el->au = kvmalloc(DEC_EL_AU_MAX, GFP_KERNEL);
+		if (!el->au)
+			return -ENOMEM;
+	}
+	if (!el->pics) {
+		el->pics = kvcalloc(DEC_DOVI_RING, sizeof(*el->pics), GFP_KERNEL);
+		if (!el->pics)
+			return -ENOMEM;
+	}
+	for (handle = 0; handle < DEC_DOVI_RING; handle++)
+		el->pics[handle].uid = -1;
+	ret = lg1314_vdec_call(v, VDEC_CALL_VDEC_OPEN, 0, NULL, 0, 0, &handle);
+	if (ret)
+		return ret;
+	if (!handle)
+		return -EBUSY;
+	el->handle = handle;
+	el->fed = el->skipped = el->decoded = el->errors = el->attached = 0;
+	el->miss_early = el->miss_late = 0;
+	el->logged = false;
+
+	ret = dec_fw_ioctl_h(ctx, handle, FW_SET_CODEC, FW_CODEC_HEVC, NULL);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_SET_INPUT_DEVICE, FW_SRC_BUFF, NULL);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_SET_OUTPUT_DEVICE, FW_DST_BUFF, NULL);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_SET_OUTPUT_MEMFMT, 0, &memfmt);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_ADD_FLAGS,
+				     FW_FLAG_DOLBY_VISION | FW_FLAG_DOVI_EL, NULL);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_INIT, 0, NULL);
+	if (!ret)
+		ret = dec_fw_ioctl_h(ctx, handle, FW_GET_NOTI_INFO, 0, &info);
+	if (!ret) {
+		el->noti_size = info.size;
+		el->noti = dec_map_ring(ctx, lg1314_vdec_copro_to_phys(v, info.addr),
+					info.size);
+		ret = dec_fw_ioctl_h(ctx, handle, FW_GET_CPB_INFO, 0, &info);
+	}
+	if (!ret) {
+		el->cpb_size = info.size;
+		el->cpb = dec_map_ring(ctx, info.addr, info.size);
+		if (!el->noti || !el->cpb)
+			ret = -ENOMEM;
+	}
+	if (ret) {
+		dev_err(ctx->dec->dev, "ctx %p: enhancement layer decoder setup failed: %d\n",
+			ctx, ret);
+		dec_el_close(ctx);
+		return ret;
+	}
+	dev_info(ctx->dec->dev, "ctx %p: enhancement layer decoder %#x open\n", ctx, handle);
+	return 0;
+}
+
+/*
+ * The access unit's enhancement layer, fed to its session under the same
+ * uid: each type-63 NAL unit without its 2-byte NAL header (stock's
+ * splitter; dovi_tool's demuxer).
+ */
+static void dec_el_feed(struct dec_ctx *ctx, const u8 *data, u32 size,
+			const struct fw_es_data *bl)
+{
+	struct dec_el *el = &ctx->el;
+	struct fw_es_nal_list *nl;
+	struct fw_buffer_info info;
+	struct fw_es_data es;
+	u32 i, n = 0, nals = 0, used;
+
+	for (i = 0; i + 5 < size; i++) {
+		u32 start, end;
+
+		if (data[i] || data[i + 1] || data[i + 2] != 1 ||
+		    (data[i + 3] >> 1 & 0x3f) != 63)
+			continue;
+		start = i + 3 + 2;		/* past the type-63 header */
+		for (end = start; end + 2 < size; end++)
+			if (!data[end] && !data[end + 1] && data[end + 2] <= 1)
+				break;
+		if (end + 2 >= size)
+			end = size;
+		if (n + 4 + end - start > DEC_EL_AU_MAX || nals == FW_MAX_NALS)
+			break;
+		el->au[n] = el->au[n + 1] = el->au[n + 2] = 0;
+		el->au[n + 3] = 1;
+		memcpy(el->au + n + 4, data + start, end - start);
+		n += 4 + end - start;
+		nals++;
+		i = end - 1;
+	}
+	if (!n)
+		return;
+
+	/* no room: this access unit's EL is lost (until the next IDR) */
+	if (dec_fw_ioctl_h(ctx, el->handle, FW_GET_CPB_INFO, 0, &info) || !info.size)
+		goto skip;
+	used = (info.write_offset - info.read_offset + info.size) % info.size;
+	if (info.size - used < n + DEC_CPB_MARGIN)
+		goto skip;
+	es = (struct fw_es_data){ .size = n };
+	if (dec_fw_ioctl_h(ctx, el->handle, FW_GET_ES_BUFFER, 0, &es) ||
+	    es.buf1_offset + es.buf1_size > el->cpb_size ||
+	    es.buf2_offset + es.buf2_size > el->cpb_size ||
+	    es.buf1_size + es.buf2_size < n)
+		goto skip;
+	memcpy(el->cpb + es.buf1_offset, el->au, min(n, es.buf1_size));
+	if (n > es.buf1_size)
+		memcpy(el->cpb + es.buf2_offset, el->au + es.buf1_size,
+		       n - es.buf1_size);
+	wmb();
+
+	nl = kzalloc(sizeof(*nl), GFP_KERNEL);
+	if (!nl)
+		goto skip;
+	nl->timestamp = bl->timestamp;
+	nl->uid = bl->uid;
+	nl->size = n;
+	nl->buf1_offset = es.buf1_offset;
+	nl->buf1_size = es.buf1_size;
+	nl->buf2_offset = es.buf2_offset;
+	nl->buf2_size = es.buf2_size;
+	nl->au_type = FW_AU_DATA;
+	nl->frame_count = bl->frame_count;
+	nl->nal_count = dec_nal_sizes(el->au, n, nl->nal_size);
+	if (dec_fw_ioctl_h(ctx, el->handle, FW_PUT_ES_BUFFER_NAL_LIST, 0, nl) >= 0)
+		el->fed++;
+	else
+		el->skipped++;
+	kfree(nl);
+	return;
+skip:
+	el->skipped++;
+}
+
+static void dec_ring_read(const void *ring, u32 ring_size, u32 off, void *out,
+			  u32 len)
+{
+	u32 first;
+
+	off %= ring_size;
+	first = min(len, ring_size - off);
+	memcpy(out, ring + off, first);
+	if (len > first)
+		memcpy(out + first, ring, len - first);
+}
+
+/*
+ * Keep an EL picture for its base layer picture, by uid; one it replaces in
+ * the ring (never shown) and one without a uid go back at once.
+ */
+static void dec_el_keep(struct dec_ctx *ctx, const struct fw_decoded *d)
+{
+	struct dec_el *el = &ctx->el;
+	s64 uid = dec_picture_uid(ctx, d);
+	struct dec_el_pic *p;
+	u32 old = 0;
+
+	if (uid < 0) {
+		dec_fw_ioctl_h(ctx, el->handle, FW_UNREF_DECODEBUFFER, 0,
+			       (void *)&d->addr_y);
+		return;
+	}
+	p = &el->pics[uid % DEC_DOVI_RING];
+	spin_lock(&dec_dpb_lock);
+	if (p->uid >= 0)
+		old = p->addr_y;
+	p->uid = uid;
+	p->addr_y = d->addr_y;
+	p->addr_c = d->addr_cb;
+	p->stride = d->stride;
+	p->size = d->width << 16 | d->height;
+	spin_unlock(&dec_dpb_lock);
+	if (old)
+		dec_fw_ioctl_h(ctx, el->handle, FW_UNREF_DECODEBUFFER, 0, &old);
+}
+
+/* The enhancement layer's decoded pictures. fw_lock held. */
+static void dec_el_drain(struct dec_ctx *ctx)
+{
+	struct dec_el *el = &ctx->el;
+	struct fw_buffer_info info;
+	u32 tail, head, hdr[2];
+
+	while (el->handle &&
+	       !dec_fw_ioctl_h(ctx, el->handle, FW_GET_NOTI_INFO, 0, &info) &&
+	       info.read_offset != info.write_offset && info.size == el->noti_size) {
+		tail = info.read_offset;
+		head = info.write_offset;
+		while (tail != head) {
+			struct fw_decoded d;
+			u32 len;
+
+			dec_ring_read(el->noti, el->noti_size, tail, hdr, sizeof(hdr));
+			len = hdr[0] - 4;
+			if (hdr[1] == FW_NOTI_DECO && len == sizeof(d)) {
+				dec_ring_read(el->noti, el->noti_size, tail + 8, &d, len);
+				if (d.addr_y) {
+					el->decoded++;
+					if (d.report & FW_REPORT_ERROR_MASK)
+						el->errors++;
+					if (!el->logged) {
+						el->logged = true;
+						dev_info(ctx->dec->dev,
+							 "ctx %p: EL picture %lld: %dx%d (display %dx%d, crop %d/%d/%d/%d) stride %d, y %#x cb %#x cr %#x, priv %#x, report %#x\n",
+							 ctx, dec_picture_uid(ctx, &d), d.width, d.height,
+							 d.display_width, d.display_height,
+							 d.crop_left, d.crop_right, d.crop_top,
+							 d.crop_bottom, d.stride, d.addr_y, d.addr_cb,
+							 d.addr_cr, d.vdec_priv, d.report);
+					}
+					dec_el_keep(ctx, &d);
+				}
+			}
+			tail = (tail + 8 + ALIGN(len, 4)) % el->noti_size;
+		}
+		dec_fw_ioctl_h(ctx, el->handle, FW_SET_NOTI_TAIL, tail, NULL);
+	}
 }
 
 static int dec_session_open(struct dec_ctx *ctx)
@@ -905,6 +1225,8 @@ static int dec_session_open(struct dec_ctx *ctx)
 	}
 
 	dev_dbg(ctx->dec->dev, "ctx %p: session %#x open\n", ctx, ctx->handle);
+	if (ctx->want_el && READ_ONCE(dec_dovi_el))
+		dec_el_open(ctx);	/* without it: the base layer alone */
 	ctx->cpb_full = false;
 	ctx->draining = ctx->eos_sent = ctx->eos_reported = false;
 	ctx->got_picture = false;
@@ -1056,6 +1378,14 @@ static void dec_set_colour(struct dec_ctx *ctx, const struct h264_geometry *g)
 		break;
 	case 13:
 		ctx->col.xfer_func = V4L2_XFER_FUNC_SRGB;
+		break;
+	case 18:
+		/*
+		 * HLG has no V4L2 code. Report the default rather than 709 so
+		 * userspace treats the transfer as unknown and falls back to
+		 * the container's tag instead of taking the stream for SDR.
+		 */
+		ctx->col.xfer_func = V4L2_XFER_FUNC_DEFAULT;
 		break;
 	default:
 		ctx->col.xfer_func = V4L2_XFER_FUNC_709;
@@ -1222,8 +1552,8 @@ static struct vb2_v4l2_buffer *dec_take_dst(struct dec_ctx *ctx, bool any_buf)
  * fw_lock held. */
 static void dec_release_returned(struct dec_ctx *ctx)
 {
-	u32 addr[VB2_MAX_FRAME];
-	unsigned int i, n = 0;
+	u32 addr[VB2_MAX_FRAME], el_addr[VB2_MAX_FRAME];
+	unsigned int i, n = 0, n_el = 0;
 
 	spin_lock(&dec_dpb_lock);
 	for (i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
@@ -1242,16 +1572,29 @@ static void dec_release_returned(struct dec_ctx *ctx)
 		sl->deferred = false;
 		if (sl->fw && sl->shown_gen == ctx->gen)
 			addr[n++] = sl->shown_addr;
+		/* its enhancement layer picture with it */
+		if (ctx->el.pics && sl->shown_gen == ctx->gen && sl->shown_uid >= 0) {
+			struct dec_el_pic *p =
+				&ctx->el.pics[sl->shown_uid % DEC_DOVI_RING];
+
+			if (p->uid == sl->shown_uid) {
+				el_addr[n_el++] = p->addr_y;
+				p->uid = -1;
+			}
+		}
 		sl->shown = sl->back = false;
 	}
 	spin_unlock(&dec_dpb_lock);
 
-	if (!n)
+	if (!n && !n_el)
 		return;
 	/* not while a frame with one of them goes to the video output */
 	lg1314_vdec_pictures_lock(ctx->dec->v, true);
 	for (i = 0; i < n && ctx->handle; i++)
 		dec_fw_ioctl(ctx, FW_UNREF_DECODEBUFFER, 0, &addr[i]);
+	for (i = 0; i < n_el && ctx->el.handle; i++)
+		dec_fw_ioctl_h(ctx, ctx->el.handle, FW_UNREF_DECODEBUFFER, 0,
+			       &el_addr[i]);
 	lg1314_vdec_pictures_unlock(ctx->dec->v, true);
 }
 
@@ -1445,6 +1788,32 @@ int lg1314_vdec_dec_picture_dovi(struct lg1314_vdec_dec *dec, u32 addr,
 			smp_rmb();
 			if (READ_ONCE(p->uid) == uid)
 				ret = profile;
+			/* its enhancement layer picture: compose with the residual */
+			pic->el_y = 0;
+			if (ret == 7 && ctx->el.pics && READ_ONCE(ctx->el.handle)) {
+				struct dec_el_pic *e =
+					&ctx->el.pics[uid % DEC_DOVI_RING];
+
+				if (e->uid == uid) {
+					pic->el_y = e->addr_y;
+					pic->el_c = e->addr_c;
+					pic->el_stride = e->stride;
+					pic->el_size = e->size;
+					pic->comp[0] = 0;
+					if (READ_ONCE(dec_dovi_nlq_test))
+						pic->comp[35] = pic->comp[102] =
+							pic->comp[169] = 0;
+					ctx->el.attached++;
+				} else {
+					if (e->uid < uid)
+						ctx->el.miss_early++;
+					else
+						ctx->el.miss_late++;
+					if (ctx->el.miss_early + ctx->el.miss_late <= 8)
+						dev_info(dec->dev, "ctx %p: EL miss: uid %lld, slot holds %lld\n",
+							 ctx, uid, e->uid);
+				}
+			}
 		}
 		if (ret != -ENOENT)
 			break;
@@ -1600,13 +1969,7 @@ static void dec_deliver(struct dec_ctx *ctx)
 /* Read len bytes of the notification ring at off (wrapping). */
 static void dec_noti_read(struct dec_ctx *ctx, u32 off, void *out, u32 len)
 {
-	u32 first;
-
-	off %= ctx->noti_size;
-	first = min(len, ctx->noti_size - off);
-	memcpy(out, ctx->noti + off, first);
-	if (len > first)
-		memcpy(out + first, ctx->noti, len - first);
+	dec_ring_read(ctx->noti, ctx->noti_size, off, out, len);
 }
 
 /* Consume the notification ring. fw_lock held. Returns true if the firmware
@@ -1665,6 +2028,7 @@ static void dec_noti_work(struct work_struct *work)
 
 	mutex_lock(&ctx->fw_lock);
 	if (ctx->handle) {
+		dec_el_drain(ctx);
 		room = dec_drain_noti(ctx);
 		dec_deliver(ctx);
 		if (room)
@@ -1702,7 +2066,7 @@ void lg1314_vdec_dec_poll(struct lg1314_vdec_dec *dec, u32 handle, u32 mask)
 		return;
 	spin_lock_irqsave(&dec->ctxs_lock, flags);
 	list_for_each_entry(ctx, &dec->ctxs, node)
-		if (ctx->handle == handle)
+		if (ctx->handle == handle || READ_ONCE(ctx->el.handle) == handle)
 			queue_work(dec->wq, &ctx->noti_work);
 	spin_unlock_irqrestore(&dec->ctxs_lock, flags);
 }
@@ -1815,6 +2179,7 @@ static int dec_dovi_detect(struct dec_ctx *ctx, const u8 *data, size_t size)
 	bool dovi = false;
 	int ret = 0;
 
+	ctx->want_el = false;
 	/*
 	 * An RPU makes the stream Dolby Vision, unless it is of a kind the
 	 * display can't compose (enhancement layer...): that plays as its base
@@ -1828,9 +2193,11 @@ static int dec_dovi_detect(struct dec_ctx *ctx, const u8 *data, size_t size)
 		ret = len > DEC_DOVI_RPU_MAX ? -E2BIG :
 		      dovi_rpu_parse(ctx->dovi_st, nal, len, ctx->dovi_buf, &rpu);
 		dovi = ret != -EOPNOTSUPP;
+		ctx->want_el = !ret && rpu.profile == 7 && !rpu.el_mel;
 		memset(ctx->dovi_st, 0, sizeof(*ctx->dovi_st));
-		dev_info(ctx->dec->dev, "ctx %p: Dolby Vision RPU (profile %u, %d): %s\n",
-			 ctx, rpu.profile, ret,
+		dev_info(ctx->dec->dev, "ctx %p: Dolby Vision RPU (profile %u%s, %d): %s\n",
+			 ctx, rpu.profile,
+			 rpu.profile != 7 || ret ? "" : rpu.el_mel ? " MEL" : " FEL", ret,
 			 dovi ? "composed" : "base layer only");
 	}
 	if (!dovi)
@@ -1905,6 +2272,8 @@ static int dec_feed(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	es.au_type = FW_AU_DATA;
 	/* a running frame number: the firmware counts what it holds with it */
 	es.frame_count = (es.uid + 1) & S32_MAX;
+	if (ctx->el.handle)
+		dec_el_feed(ctx, data, size, &es);
 	if (dec_is_hevc(ctx)) {
 		/* HEVC's decoder finds slices only as separate NAL units: with
 		 * a picture's slices in one piece, it decodes the first */
@@ -1950,8 +2319,8 @@ static bool dec_wait_geometry(struct dec_ctx *ctx, struct vb2_v4l2_buffer *src)
 	if (dec_is_hevc(ctx))
 		/* allocated as the decoder needs them, up to this; no spares:
 		 * a copied picture of the decoder's layout can't be shown */
-		ctx->cap_min = max(g.dpb_frames + DEC_FW_PICS_EXTRA + 1,
-				   DEC_HEVC_PICS_MIN);
+		ctx->cap_min = max(g.dpb_frames + READ_ONCE(dec_hevc_pics_extra),
+				   READ_ONCE(dec_hevc_pics_min));
 	else if (READ_ONCE(dec_zerocopy))
 		ctx->cap_min = max(g.dpb_frames + DEC_FW_PICS_EXTRA,
 				   g.width * g.height > 1920 * 1088 ?
@@ -1995,7 +2364,8 @@ static void dec_device_run(void *priv)
 		 * access unit at a time until the first picture. The firmware
 		 * doesn't report pictures it skips, so its own count is asked.
 		 */
-		if (dec_fw_queued(ctx) >= (ctx->got_picture ? DEC_FW_QUEUE : 1)) {
+		if (dec_fw_queued(ctx) >= (ctx->got_picture ?
+					   max(READ_ONCE(dec_fw_queue), 1u) : 1)) {
 			ctx->cpb_full = true;
 			schedule_delayed_work(&ctx->retry_work,
 					      msecs_to_jiffies(DEC_FW_QUEUE_POLL_MS));
@@ -2605,6 +2975,8 @@ static int dec_release(struct file *file)
 	v4l2_fh_exit(&ctx->fh);
 	v4l2_ctrl_handler_free(&ctx->ctrls);
 	dec_dovi_free(ctx);
+	kvfree(ctx->el.pics);
+	kvfree(ctx->el.au);
 	kvfree(ctx);
 	return 0;
 }

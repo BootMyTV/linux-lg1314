@@ -86,8 +86,10 @@ struct lg1314_vdec_vo {
 	struct mutex			lock;	/* serialises calls */
 	struct fw_vo_fb_info		fb;	/* geometry last set */
 
-	u32				*extra;	/* per-picture extra block, or NULL */
+	u32				*extra;	/* per-picture extra blocks, or NULL */
 	u32				extra_phys;
+	unsigned int			extra_next;
+	unsigned int			dovi_profile;
 
 	/* Decoder pictures the output holds, by frame id (held_lock), until
 	 * it releases them: the decoder keeps them meanwhile. */
@@ -107,6 +109,9 @@ static LIST_HEAD(vo_list);
 #define VO_EXT_ADDITIONAL_FRAME	0x20
 #define VO_FLAG_DOLBY		BIT(1)	/* the output's Dolby Vision display mode */
 #define VO_EXTRA_SIZE		SZ_4K
+/* a block per picture written: the firmware reads it when it shows it */
+#define VO_EXTRA_WORDS		32
+#define VO_EXTRA_BLOCKS		(VO_EXTRA_SIZE / (VO_EXTRA_WORDS * 4))
 static DEFINE_SPINLOCK(vo_list_lock);
 
 static int vo_ioctl(struct lg1314_vdec_vo *vo, unsigned int cmd, u32 arg,
@@ -286,38 +291,14 @@ struct lg1314_vdec_vo *lg1314_vdec_vo_open(struct lg1314_vdec *v,
 	if (!ret)
 		ret = vo_ioctl(vo, VO_SET_OUTPUT_PORT, 0, &port);
 	/* Dolby Vision: the display mode before the first picture, and every
-	 * picture's extra block (the profile, no enhancement layer). */
+	 * picture's extra block (vo_extra()). */
 	if (!ret && dovi_profile)
 		ret = vo_ioctl(vo, VO_ADD_FLAGS, VO_FLAG_DOLBY, NULL);
 	if (!ret && dovi_profile) {
-		u32 *e = lg1314_vdec_mem_alloc(v, VO_EXTRA_SIZE, &vo->extra_phys);
-
-		if (!e) {
+		vo->extra = lg1314_vdec_mem_alloc(v, VO_EXTRA_SIZE, &vo->extra_phys);
+		vo->dovi_profile = dovi_profile;
+		if (!vo->extra)
 			ret = -ENOMEM;
-		} else {
-			e[0] = VO_EXT_DOVI_PROFILEID;
-			e[1] = 4;
-			e[2] = dovi_profile;
-			e[3] = VO_EXT_DOVI_MEL;
-			e[4] = 4;
-			e[5] = 0;
-			/* the enhancement-layer frame: none (as stock sends it for a
-			 * single-layer stream) */
-			e[6] = VO_EXT_ADDITIONAL_FRAME;
-			e[7] = 0x24;
-			e[8] = 0;
-			e[9] = 1920 << 16 | 1080;
-			e[10] = 0;
-			e[11] = 0;
-			e[12] = 0xffffffff;
-			e[13] = 0xffffffff;
-			e[14] = 0xf00;
-			e[15] = 1;
-			e[16] = 1;
-			e[17] = VO_EXT_END;
-			e[18] = 0;
-			vo->extra = e;
-		}
 	}
 	if (ret) {
 		lg1314_vdec_vo_close(vo);
@@ -330,6 +311,38 @@ err_free:
 	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(lg1314_vdec_vo_open);
+
+/*
+ * A Dolby Vision picture's extra block, as stock's sequencer builds it: the
+ * profile, MEL (0), and the enhancement layer's frame. Profile 7 with its EL
+ * picture; without one, single layer (the firmware shows black waiting for
+ * an EL frame otherwise) with stock's "no picture" entry.
+ */
+static void vo_extra(struct lg1314_vdec_vo *vo, u32 *e,
+		     const struct lg1314_vdec_vo_frame *f)
+{
+	bool el = f->el_y;
+
+	e[0] = VO_EXT_DOVI_PROFILEID;
+	e[1] = 4;
+	e[2] = vo->dovi_profile == 7 && !el ? 8 : vo->dovi_profile;
+	e[3] = VO_EXT_DOVI_MEL;
+	e[4] = 4;
+	e[5] = 0;
+	e[6] = VO_EXT_ADDITIONAL_FRAME;
+	e[7] = 0x24;
+	e[8] = 0;
+	e[9] = el ? f->el_size : 1920 << 16 | 1080;
+	e[10] = 0;				/* crop top / bottom */
+	e[11] = 0;				/* crop left / right */
+	e[12] = el ? f->el_y : 0xffffffff;
+	e[13] = el ? f->el_c : 0xffffffff;
+	e[14] = el ? f->el_stride : 0xf00;
+	e[15] = 1;				/* format: the decoder's tiled */
+	e[16] = 1;				/* tiled */
+	e[17] = VO_EXT_END;
+	e[18] = 0;
+}
 
 int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 			 const struct lg1314_vdec_vo_frame *f)
@@ -346,7 +359,6 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 		.multi_picture_index = -1,
 		.addr_y = f->addr_y,
 		.addr_cb = f->addr_c,
-		.extra = vo->extra ? vo->extra_phys : 0,
 	};
 	u32 c;
 	int ret = 0;
@@ -368,6 +380,12 @@ int lg1314_vdec_vo_write(struct lg1314_vdec_vo *vo,
 	}
 
 	mutex_lock(&vo->lock);
+	if (vo->extra) {
+		unsigned int i = vo->extra_next++ % VO_EXTRA_BLOCKS;
+
+		vo_extra(vo, vo->extra + i * VO_EXTRA_WORDS, f);
+		w.extra = vo->extra_phys + i * VO_EXTRA_WORDS * 4;
+	}
 	if (memcmp(&fb, &vo->fb, sizeof(fb))) {
 		ret = vo_ioctl(vo, VO_SET_FRAMEBUFFER_INFO, 0, &fb);
 		if (!ret)

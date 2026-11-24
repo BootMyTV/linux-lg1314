@@ -40,6 +40,8 @@ struct lg1314_vdec_vo_frame {
 	bool	tiled;			/* LG1314_FORMAT_MOD_NV12_8X4, a decoder
 					 * picture still held by userspace */
 	s64	pts_ns;			/* presentation time, -1: none */
+	/* Dolby Vision profile 7: the enhancement layer's picture (0: none) */
+	u32	el_y, el_c, el_stride, el_size;	/* el_size: width << 16 | height */
 };
 
 /* The decoder device behind @np, once its firmware is running. */

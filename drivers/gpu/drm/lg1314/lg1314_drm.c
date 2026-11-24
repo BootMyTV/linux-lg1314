@@ -276,6 +276,7 @@ static irqreturn_t lg1314_video_tick_irq(int irq, void *arg)
 		lg->tick_last_ns = now;
 		WRITE_ONCE(lg->tick_seq, lg->tick_seq + 1);
 		drm_crtc_handle_vblank(&lg->crtc);
+		lg1314_hdr_tick(lg);
 	}
 	return IRQ_HANDLED;
 }
@@ -677,7 +678,7 @@ static int lg1314_get_de_regions(struct lg1314_drm *lg)
 {
 	struct lg1314_de_mem *m = &lg->de_mem;
 	struct resource fw;
-	int ret;
+	int ret, idx;
 
 	ret = lg1314_get_region(lg, "de-fw", &fw);
 	if (!ret)
@@ -704,6 +705,30 @@ static int lg1314_get_de_regions(struct lg1314_drm *lg)
 	lg->de_fw_phys = fw.start;
 	lg->de_fw_size = resource_size(&fw);
 
+	/* Optional: the span of every "vdec-shared" region. */
+	ret = of_property_count_strings(lg->dev->of_node, "memory-region-names");
+	for (idx = 0; idx < ret; idx++) {
+		const char *name;
+		struct device_node *np;
+		struct resource r;
+
+		if (of_property_read_string_index(lg->dev->of_node, "memory-region-names",
+						  idx, &name) || strcmp(name, "vdec-shared"))
+			continue;
+		np = of_parse_phandle(lg->dev->of_node, "memory-region", idx);
+		if (!np || of_address_to_resource(np, 0, &r)) {
+			of_node_put(np);
+			return dev_err_probe(lg->dev, -EINVAL, "bad vdec-shared region\n");
+		}
+		of_node_put(np);
+		if (!m->vdec_shared.end) {
+			m->vdec_shared = r;
+		} else {
+			m->vdec_shared.start = min(m->vdec_shared.start, r.start);
+			m->vdec_shared.end = max(m->vdec_shared.end, r.end);
+		}
+	}
+
 	/* The DE reads pictures from the decoded-picture and surface pools. */
 	lg->video_mem_start = min(m->vdec_dpb.start, m->scanout.start);
 	lg->video_mem_end = max(m->vdec_dpb.end, m->scanout.end) + 1;
@@ -723,6 +748,19 @@ static int lg1314_get_micom(struct lg1314_drm *lg)
 	if (!lg->micom)
 		return -EPROBE_DEFER;
 	return 0;
+}
+
+/* The panel's timing controller, for its highlight boost (optional). */
+static int lg1314_get_tcon(struct lg1314_drm *lg)
+{
+	struct device_node *np;
+
+	np = of_parse_phandle(lg->dev->of_node, "lge,tcon", 0);
+	if (!np)
+		return 0;
+	lg->hdr.tcon = of_find_i2c_device_by_node(np);
+	of_node_put(np);
+	return lg->hdr.tcon ? 0 : -EPROBE_DEFER;
 }
 
 static void lg1314_release_rmem(void *dev)
@@ -758,6 +796,9 @@ static int lg1314_probe(struct platform_device *pdev)
 	ret = drmm_mutex_init(&lg->drm, &lg->de_lock);
 	if (ret)
 		return ret;
+	ret = lg1314_hdr_setup(lg);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < LG1314_REG_COUNT; i++) {
 		lg->mmio[i].phys = lg1314_regions[i].phys;
@@ -771,6 +812,9 @@ static int lg1314_probe(struct platform_device *pdev)
 	ret = lg1314_get_micom(lg);
 	if (ret)
 		return ret;
+	ret = lg1314_get_tcon(lg);
+	if (ret)
+		goto err_micom;
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
@@ -843,6 +887,8 @@ static int lg1314_probe(struct platform_device *pdev)
 err_video:
 	lg1314_video_fini(lg);
 err_micom:
+	if (lg->hdr.tcon)
+		put_device(&lg->hdr.tcon->dev);
 	put_device(&lg->micom->dev);
 	return ret;
 }
@@ -853,7 +899,10 @@ static void lg1314_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&lg->drm);
 	drm_atomic_helper_shutdown(&lg->drm);
+	lg1314_hdr_fini(lg);
 	lg1314_video_fini(lg);
+	if (lg->hdr.tcon)
+		put_device(&lg->hdr.tcon->dev);
 	put_device(&lg->micom->dev);
 }
 
@@ -862,6 +911,7 @@ static void lg1314_shutdown(struct platform_device *pdev)
 	struct lg1314_drm *lg = platform_get_drvdata(pdev);
 
 	drm_atomic_helper_shutdown(&lg->drm);
+	lg1314_hdr_fini(lg);
 }
 
 static const struct of_device_id lg1314_of_match[] = {
