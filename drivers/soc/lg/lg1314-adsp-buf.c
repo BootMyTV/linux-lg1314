@@ -222,6 +222,7 @@ struct adsp_shbuf *adsp_shbuf_alloc(struct lg1314_adsp *adsp, int dsp, u32 reade
 	sb->dsp = dsp;
 	sb->reader = reader;
 	sb->size = size;
+	sb->phys = phys;
 	sb->offset = DSP_SHMEM_BASE + (phys - (adsp->mem_phys + MEM_SE));
 	sb->max_au = max_au;
 	sb->au_max_len = au_max_len;

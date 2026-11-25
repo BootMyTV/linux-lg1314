@@ -21,8 +21,8 @@
  *
  * The second mixer input is an HDMI receiver port: the receiver's I2S reaches the
  * audio block, DSP0's HDMI_IN_0 captures the port it is told (HAL_SetHdmiInputPort
- * at its start) and hands 2 x s32 frames to DSP1. Its samples are ~48 dB below
- * full scale (a headroom format), which PCMCVT_P12's gain makes up.
+ * at its start) and hands 2 x s32 frames to DSP1: 24-bit samples in bits 31:8,
+ * full-scale s32 (a 0 dBFS sine peaks at 0x7fffff00), so the converters' gain is 0 dB.
  *
  * (Stock reads the system mix through PCMREN_P0 / DAP before PCMCVT_P13; with
  * Dolby processing off the SE path is mixer -> SE.) PCMCVT_P13 takes the stream
@@ -102,7 +102,7 @@
 #define HDMI_CMD_SET_FMT	ADSP_CMD(0x4300, 16)	/* {I2S/LJ/RJ, resolution, sck, lrck pol} */
 #define HDMI_CMD_SET_MODE	ADSP_CMD(0x4301, 12)	/* {0 PCM / codec, port, 0 I2S} */
 #define PCMCVT_CMD_SET_GAIN	ADSP_CMD(0x5004, 8)	/* {Q23 gain, enable} */
-#define PCMCVT_GAIN_HDMI	0x7fffffff		/* ~ +48 dB */
+#define PCMCVT_GAIN_HDMI	0x00800000		/* 0 dB: the input is full-scale s32 */
 #define GAIN_CMD_SET_GAIN	ADSP_CMD(0x6600, 4)	/* new-style gain: Q23 */
 #define GAIN_CMD_SET_CHANNEL	ADSP_CMD(0x6601, 4)
 #define PCMCVT_CMD_CHANGE_FS	ADSP_CMD(0x5003, 8)	/* {in Hz, out Hz}: resamples */
@@ -341,7 +341,7 @@ static int se_legacy_buffer(struct adsp_se *se, int rd_dsp, u32 rd, int wr_dsp, 
  * The HDMI branches, built once (the inputs stay stopped until a port plays):
  * DSP0's HDMI inputs, a shared buffer each to DSP1 (both ends attached by their
  * managers, as stock's connection manager does between legacy modules), the
- * converters (+48 dB), and branch 1's glue. Outputs are attached later.
+ * converters (0 dB), and branch 1's glue. Outputs are attached later.
  */
 static int se_build_hdmi(struct adsp_se *se)
 {

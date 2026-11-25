@@ -226,6 +226,7 @@ struct adsp_shbuf {
 	u32 reader;		/* reader glue uid */
 	void *mem;		/* header, AU table, data */
 	u32 size;
+	phys_addr_t phys;
 	u32 offset;		/* DSP-visible address */
 	void *data;
 	u32 data_size;

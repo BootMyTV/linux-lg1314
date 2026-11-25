@@ -653,6 +653,18 @@ static int adsp_status_show(struct seq_file *s, void *unused)
 			   sb->data_size, sb->max_au, sb->st.read_idx, sb->st.read_off,
 			   sb->st.write_idx, sb->st.write_off);
 	}
+	/* every shared buffer, with its physical address (to inspect samples) */
+	mutex_lock(&adsp->shbuf_lock);
+	{
+		struct adsp_shbuf *sb;
+
+		list_for_each_entry(sb, &adsp->shbufs, list)
+			seq_printf(s, "shbuf %08x reader %02x on dsp%d: phys %pa size %#x "
+				   "data +%#x size %#x\n", sb->uid, sb->reader, sb->dsp,
+				   &sb->phys, sb->size, (u32)(sb->data - sb->mem),
+				   sb->data_size);
+	}
+	mutex_unlock(&adsp->shbuf_lock);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(adsp_status);
