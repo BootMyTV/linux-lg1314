@@ -78,11 +78,13 @@
 #define HDR_MODE_HDR10		2
 #define HDR_MODE_HLG		5
 
-/* HDR block registers, window 0 */
+/* HDR block registers, window 0 (window 1's block: + PE_HDR_WIN1) */
 #define PE_HDR_PHYS		0xc9005800
+#define PE_HDR_WIN1		0x1000
 #define HDR_TOP_CTRL_05		0x014		/* reg_hist_src [23:20] */
 #define HDR_MODE_MASK		GENMASK(31, 30)	/* reg_hdr_mode */
 #define HDR_MODE_LUT		2		/* through the block (0: bypass) */
+#define HDR_EOTF_EN		BIT(24)		/* reg_eotf_en: the EOTF LUT (PQ/HLG -> linear) */
 #define HDR_HUE_SAT_CTRL	0x0d0
 #define HDR_HUE_SAT_ALPHA	0x0d4
 #define HDR_DITHER_CTRL_00	0x2e8
@@ -471,6 +473,57 @@ static void hdr_rmw(struct lg1314_drm *lg, u32 off, u32 mask, u32 val)
 	lg1314_wr(lg, PE_HDR_PHYS + off, (v & ~mask) | (val & mask));
 }
 
+/*
+ * Window 1's HDR block gets window 0's settings: a picture split over two paths
+ * (4K120 from the HDMI switch) runs its right half through window 1's PE, and the
+ * firmware leaves that block at its defaults (wrapped colours). The vendor driver
+ * does the same for every mode (PE_HDR_HW_M19_HFR_DUAL_SETTINGS).
+ */
+static const u16 hdr_mirror_regs[] = {
+	HDR_TOP_CTRL_05, HDR_HUE_SAT_CTRL, HDR_HUE_SAT_ALPHA, HDR_DITHER_CTRL_00,
+	HDR_PCC_CTRL_01, HDR_PCC_CTRL_01 + 4, HDR_PCC_CTRL_01 + 8, HDR_PCC_CTRL_01 + 12,
+	HDR_PCC_CTRL_01 + 16,
+};
+
+static void hdr_mirror(struct lg1314_drm *lg)
+{
+	int k;
+
+	for (k = 0; k < ARRAY_SIZE(hdr_mirror_regs); k++)
+		lg1314_wr(lg, PE_HDR_PHYS + PE_HDR_WIN1 + hdr_mirror_regs[k],
+			  lg1314_rd(lg, PE_HDR_PHYS + hdr_mirror_regs[k]));
+	for (k = 0; k < 8; k++) {
+		lg1314_wr(lg, PE_HDR_PHYS + PE_HDR_WIN1 + HDR_LGAIN_LUT + 4 * k,
+			  lg1314_rd(lg, PE_HDR_PHYS + HDR_LGAIN_LUT + 4 * k));
+		lg1314_wr(lg, PE_HDR_PHYS + PE_HDR_WIN1 + HDR_SGAIN_LUT + 4 * k,
+			  lg1314_rd(lg, PE_HDR_PHYS + HDR_SGAIN_LUT + 4 * k));
+	}
+}
+
+void lg1314_hdr_mirror(struct lg1314_drm *lg)
+{
+	mutex_lock(&lg->hdr.lock);
+	hdr_mirror(lg);
+	mutex_unlock(&lg->hdr.lock);
+}
+
+/*
+ * After an input's window set-up: the firmware resets part of the block then
+ * (the EOTF enable at least); write the current mode's registers again, for
+ * both windows.
+ */
+static void hdr_regs(struct lg1314_drm *lg, u32 mode);
+
+void lg1314_hdr_reassert(struct lg1314_drm *lg)
+{
+	if (!lg->hdr.fw)
+		return;
+	mutex_lock(&lg->hdr.lock);
+	hdr_regs(lg, lg1314_hdr_mode(lg));
+	mutex_unlock(&lg->hdr.lock);
+}
+
+
 /* The registers the vendor driver writes for SDR, HDR10 or HLG (SetModeInfo,
  * SetColorCorrect). */
 static void hdr_regs(struct lg1314_drm *lg, u32 mode)
@@ -486,9 +539,14 @@ static void hdr_regs(struct lg1314_drm *lg, u32 mode)
 	 * Everything goes through the block (the firmware sets that itself
 	 * once it has the table area, at the first video session; SDR too).
 	 */
+	/*
+	 * The EOTF stage: the firmware switches it on itself for HDR video, not
+	 * for an HDMI input (the input then looks washed out: PQ shown as
+	 * if linear); set it as it does.
+	 */
 	hdr_rmw(lg, HDR_TOP_CTRL_05,
-		HDR_MODE_MASK | GENMASK(23, 20) | GENMASK(17, 16),
-		HDR_MODE_LUT << 30 | PRSV_SRC_VENDOR << 16 |
+		HDR_MODE_MASK | HDR_EOTF_EN | GENMASK(23, 20) | GENMASK(17, 16),
+		HDR_MODE_LUT << 30 | (hdr ? HDR_EOTF_EN : 0) | PRSV_SRC_VENDOR << 16 |
 		(mode == HDR_MODE_HLG ? HIST_SRC_Y : HIST_SRC_MAX_RGB) << 20);
 	hdr_rmw(lg, HDR_HUE_SAT_ALPHA, 0x1111, hdr ? ALPHA_HDR10 : ALPHA_SDR);
 	lg1314_wr(lg, PE_HDR_PHYS + HDR_DITHER_CTRL_00,
@@ -508,6 +566,7 @@ static void hdr_regs(struct lg1314_drm *lg, u32 mode)
 			  le32_to_cpu(cc->sgain_x[k]) << 16 |
 			  (le32_to_cpu(cc->sgain_y[k]) & 0xffff));
 	}
+	hdr_mirror(lg);
 }
 
 /*
@@ -1228,10 +1287,15 @@ void lg1314_hdr_kick(struct lg1314_drm *lg)
 
 int lg1314_hdr_setup(struct lg1314_drm *lg)
 {
+	int ret;
+
 	INIT_WORK(&lg->hdr.dtm_work, lg1314_hdr_work);
 	lg->hdr.boost_level = -1;
 	lg->hdr.boost_shown = BOOST_OFF;
 	lg->hdr.wcg_section = -2;
+	ret = drmm_mutex_init(&lg->drm, &lg->hdr.src_lock);
+	if (ret)
+		return ret;
 	return drmm_mutex_init(&lg->drm, &lg->hdr.lock);
 }
 
@@ -1258,7 +1322,7 @@ void lg1314_hdr_fini(struct lg1314_drm *lg)
 #define PE_ND0_TNR_CTRL_00	0xc9003140	/* reg_tnr_en [0] */
 #define PE_ND1_TNR_CTRL_00	0xc9004140
 
-static void lg1314_pe_commit(struct lg1314_drm *lg)
+void lg1314_pe_tnr_off(struct lg1314_drm *lg)
 {
 	static const u32 tnr[] = { PE_ND0_TNR_CTRL_00, PE_ND1_TNR_CTRL_00 };
 	int i;
@@ -1278,20 +1342,57 @@ void lg1314_hdr_commit(struct lg1314_drm *lg, struct drm_atomic_state *state)
 	struct drm_property_blob *blob;
 	const struct hdr_output_metadata *md = NULL;
 
-	lg1314_pe_commit(lg);
+	lg1314_pe_tnr_off(lg);
 	if (!cs || !lg->hdr.fw)
 		return;
 	blob = cs->hdr_output_metadata;
 	if (blob && blob->length >= sizeof(*md))
 		md = blob->data;
 
+	mutex_lock(&lg->hdr.src_lock);
 	if (lg->hdr.applied &&
 	    (blob ? blob->base.id : 0) == lg->hdr.blob_id)
-		return;
+		goto out;
 	lg->hdr.blob_id = blob ? blob->base.id : 0;
 	lg->hdr.applied = true;
-	lg1314_hdr_apply(lg, md && md->metadata_type == HDMI_STATIC_METADATA_TYPE1 ?
-			 &md->hdmi_metadata_type1 : NULL);
+	lg->hdr.commit_md_set = md && md->metadata_type == HDMI_STATIC_METADATA_TYPE1;
+	if (lg->hdr.commit_md_set)
+		lg->hdr.commit_md = md->hdmi_metadata_type1;
+	/* while an input shows, its own metadata rules; this one waits */
+	if (!lg->hdr.input)
+		lg1314_hdr_apply(lg, lg->hdr.commit_md_set ? &lg->hdr.commit_md : NULL);
+out:
+	mutex_unlock(&lg->hdr.src_lock);
+}
+
+/*
+ * An HDMI input shows: its HDR infoframe (eotf 0: SDR) drives the block, as a
+ * commit's metadata does for video. Applied when it changes.
+ */
+void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md)
+{
+	if (!lg->hdr.fw)
+		return;
+	mutex_lock(&lg->hdr.src_lock);
+	if (!lg->hdr.input || memcmp(md, &lg->hdr.input_md, sizeof(*md))) {
+		lg->hdr.input = true;
+		lg->hdr.input_md = *md;
+		lg1314_hdr_apply(lg, md->eotf ? md : NULL);
+	}
+	mutex_unlock(&lg->hdr.src_lock);
+}
+
+/* The input is gone: back to the last commit's metadata. */
+void lg1314_hdr_release_input(struct lg1314_drm *lg)
+{
+	if (!lg->hdr.fw)
+		return;
+	mutex_lock(&lg->hdr.src_lock);
+	if (lg->hdr.input) {
+		lg->hdr.input = false;
+		lg1314_hdr_apply(lg, lg->hdr.commit_md_set ? &lg->hdr.commit_md : NULL);
+	}
+	mutex_unlock(&lg->hdr.src_lock);
 }
 
 /*

@@ -44,7 +44,7 @@ static const struct {
 	[LG1314_REG_DPE]    = { 0xc9020000, 0x1000 },
 	[LG1314_REG_PLL]    = { 0xc9c10000, 0x1000 },
 	[LG1314_REG_IMX]    = { IMX_PHYS, 0x100 },
-	[LG1314_REG_PE_HDR] = { 0xc9005800, 0x400 },
+	[LG1314_REG_PE_HDR] = { 0xc9005800, 0x1400 },	/* HDR blocks, windows 0 and 1 */
 	[LG1314_REG_PE_ND]  = { 0xc9003000, 0x2000 },
 };
 
@@ -256,8 +256,12 @@ static irqreturn_t lg1314_vsync_irq(int irq, void *arg)
 	lg1314_osd_sharpen_update(lg);
 
 	vblank = !READ_ONCE(lg->video_phase) && (++lg->vsync_count & 1);
-	if (vblank)
+	if (vblank) {
 		drm_crtc_handle_vblank(&lg->crtc);
+		/* an HDMI input has no video ticks: the HDR work runs from here */
+		if (READ_ONCE(lg->input.shown))
+			lg1314_hdr_tick(lg);
+	}
 	return IRQ_HANDLED;
 }
 

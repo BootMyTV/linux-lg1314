@@ -29,6 +29,7 @@
 #include <linux/of_platform.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include <linux/v4l2-dv-timings.h>
@@ -78,6 +79,10 @@
 
 /* ALED top (shared) */
 #define ALED_I2C_CLK_SEL	0x050
+/* per-port ALED blocks (aled-ports + 0x400 * port) */
+#define ALED_PORT_SIZE		0x400
+#define ALED_AD_HPD		0x254	/* HDMI20_RX_ALED_AD_HPD */
+#define  ALED_AD_HPD_SET_HPD	BIT(0)
 
 /* controller (Synopsys, RA_*) */
 #define RA_HDMI_SETUP_CTRL	0x000
@@ -101,6 +106,8 @@
 #define RA_HDMI_CKM_F		0x098
 #define  CKM_MINFREQ		GENMASK(15, 0)
 #define  CKM_MAXFREQ		GENMASK(31, 16)
+#define RA_HDMI_CKM_RESULT	0x09c
+#define  CKM_CLKRATE		GENMASK(15, 0)	/* TMDS clock measured; 0: none */
 #define RA_HDMI_STS		0x0bc
 #define RA_HDCP_CTRL		0x0c0
 #define RA_HDCP_BCAPS		0x0c4
@@ -143,12 +150,16 @@
 #define  PHYG3_PORTSEL		GENMASK(3, 2)
 #define RA_PDEC_CTRL		0x300
 #define  PFIFO_STORE_FILTER_EN	BIT(31)
+#define  PFIFO_STORE_HDR	BIT(29)	/* LG's hdmi_rx_ctrl_packet_HDR (13) */
 #define  PD_FIFO_FILL_INFO_CLR	BIT(8)
 #define  PD_FIFO_CLR		BIT(5)
 #define  PD_FIFO_WE		BIT(4)
 #define  PDEC_BCH_EN		BIT(0)
 #define RA_PDEC_ERR_FILTER	0x33c
 #define RA_PDEC_ASP_CTRL	0x340
+#define RA_PDEC_FIFO_STS	0x308
+#define  PD_FIFO_FILL_MAX	GENMASK(25, 16)	/* words, since the last fill-info clear */
+#define RA_PDEC_FIFO_DATA	0x30c	/* 8 reads per packet: HB0..2, 0, PB0..27 */
 #define RA_PDEC_STS		0x360
 #define RA_PDEC_AUD_STS		0x364
 #define  AUD_STS_SAMPLES	BIT(0)	/* audio sample packets */
@@ -287,12 +298,16 @@ struct hdmirx_port {
 	bool aud_muted;
 	bool acr_clear;			/* first ACR update after a reset: zeros, as stock */
 	unsigned int aud_stable;	/* polls without FIFO error */
+	/* HDR infoframe (Dynamic Range and Mastering), from the packet FIFO */
+	struct hdr_metadata_infoframe hdr;	/* eotf 0 without one */
+	unsigned long hdr_seen;		/* jiffies of the last one */
 	unsigned int acr_err;		/* polls with an empty FIFO */
 };
 
 struct lg1314_hdmirx {
 	struct device *dev;
 	void __iomem *aled;
+	void __iomem *aled_port;	/* per-port ALED blocks */
 	void __iomem *ddc;
 	void __iomem *gate;
 	struct gpio_desc *isol;
@@ -304,6 +319,14 @@ struct lg1314_hdmirx {
 	struct lg_hawk2 *sw;		/* HDMI switch in front, if any */
 	int connector_port[LG1314_HDMIRX_CONNECTORS];	/* HDMI k -> port */
 	unsigned int selected;		/* connector shown (lg1314_hdmirx_select) */
+	/*
+	 * Receiver ports the switch spreads each connector's picture over (1: none),
+	 * as of the last poll; the picture is then on the ports of HDMI 1..n, left to
+	 * right (stock's _VFE_HDMI_CheckVideoSplitTimingValid), whatever the
+	 * connector. split_conn: the connector split now (0: none).
+	 */
+	unsigned int split[LG1314_HDMIRX_CONNECTORS];
+	unsigned int split_conn;
 	struct blocking_notifier_head notifier;
 };
 
@@ -488,7 +511,13 @@ static void hdmirx_phy_update(struct hdmirx_port *p)
 		}
 	}
 
-	locked = (tcs & BIT(4)) && (ctrl_rd(p, RA_LINK_PHY_LOCK) & LINK_PHY_LOCKED);
+	/*
+	 * TCS done and the link-PHY lock can stay set after the clock goes (seen on
+	 * a port the HDMI switch stopped feeding when a split ended): also require
+	 * the controller to measure a clock.
+	 */
+	locked = (tcs & BIT(4)) && (ctrl_rd(p, RA_LINK_PHY_LOCK) & LINK_PHY_LOCKED) &&
+		 (ctrl_rd(p, RA_HDMI_CKM_RESULT) & CKM_CLKRATE);
 	if (locked && !p->locked) {
 		ctrl_wr(p, RA_DMI_SW_RST, LG_FF0_RESET_0);
 		dev_info(p->rx->dev, "port %u: link locked (%s)\n", p->id, p->ud ? "6G" : "3G");
@@ -715,6 +744,93 @@ static void hdmirx_audio_poll(struct hdmirx_port *p)
 }
 
 /* hdmi_rx_ctrl_config */
+/*
+ * The source's HDR infoframe (CTA-861 Dynamic Range and Mastering, type 0x87). The
+ * controller stores one in the packet FIFO each time it arrives (every frame). The
+ * FIFO's status bits are no help here (the "new entry" one is a latched interrupt
+ * status, cleared with the audio ones; reading past the end doesn't underflow, it
+ * returns stale words), so: after a clear, read the first packet if one arrived
+ * (the fill high-water mark says so), check it, clear again. Dropped when none
+ * came for a while.
+ */
+#define HDR_IF_TYPE		0x87
+#define HDR_IF_TIMEOUT_MS	500
+
+static bool hdmirx_hdr_parse(const u8 *b, struct hdr_metadata_infoframe *md)
+{
+	unsigned int len = b[2], i;
+	const u8 *pb = &b[4];
+	u8 sum = b[0] + b[1] + b[2];
+
+	if (b[0] != HDR_IF_TYPE || b[1] != 1 || len < 26 || len > 27)
+		return false;
+	for (i = 0; i <= len; i++)
+		sum += pb[i];
+	if (sum)
+		return false;
+	memset(md, 0, sizeof(*md));
+	md->eotf = pb[1] & 7;
+	md->metadata_type = pb[2] & 7;
+	for (i = 0; i < 3; i++) {
+		md->display_primaries[i].x = get_unaligned_le16(&pb[3 + 4 * i]);
+		md->display_primaries[i].y = get_unaligned_le16(&pb[5 + 4 * i]);
+	}
+	md->white_point.x = get_unaligned_le16(&pb[15]);
+	md->white_point.y = get_unaligned_le16(&pb[17]);
+	md->max_display_mastering_luminance = get_unaligned_le16(&pb[19]);
+	md->min_display_mastering_luminance = get_unaligned_le16(&pb[21]);
+	md->max_cll = get_unaligned_le16(&pb[23]);
+	md->max_fall = get_unaligned_le16(&pb[25]);
+	return true;
+}
+
+/*
+ * The DE firmware learns an input's HDR state from this LG register (it reads it
+ * through the receiver's second window at 0xC9040000 + 0x8000 * port + 0x7f40) and
+ * only then treats the window as HDR (mode, EOTF, tone curves). Stock
+ * HDMI20_HAL_SetCscHdrInfoToVSC: EOTF [3:0], max mastering luminance in thousands
+ * of nits, rounded up, 1..15, [7:4].
+ */
+#define RA_LG_HDR_INFO		0x1f40
+
+static void hdmirx_hdr_info(struct hdmirx_port *p)
+{
+	unsigned int lum = p->hdr.max_display_mastering_luminance;
+	u32 v = (lum ? min((lum - 1) / 1000 + 1, 15u) : 1) << 4 | (p->hdr.eotf & 0xf);
+
+	if (ctrl_rd(p, RA_LG_HDR_INFO) != v)
+		ctrl_wr(p, RA_LG_HDR_INFO, v);
+}
+
+static void hdmirx_pdec_fifo_clear(struct hdmirx_port *p)
+{
+	u32 v = ctrl_rd(p, RA_PDEC_CTRL);
+
+	ctrl_wr(p, RA_PDEC_CTRL, v | PD_FIFO_CLR | PD_FIFO_FILL_INFO_CLR);
+	ctrl_wr(p, RA_PDEC_CTRL, v & ~(PD_FIFO_CLR | PD_FIFO_FILL_INFO_CLR));
+}
+
+static void hdmirx_hdr_poll(struct hdmirx_port *p)
+{
+	struct hdr_metadata_infoframe md;
+	unsigned int i;
+	u8 b[32];
+
+	if (p->locked && FIELD_GET(PD_FIFO_FILL_MAX, ctrl_rd(p, RA_PDEC_FIFO_STS)) >= 8) {
+		for (i = 0; i < sizeof(b); i += 4)
+			put_unaligned_le32(ctrl_rd(p, RA_PDEC_FIFO_DATA), &b[i]);
+		if (hdmirx_hdr_parse(b, &md)) {
+			p->hdr = md;
+			p->hdr_seen = jiffies;
+		}
+	}
+	hdmirx_pdec_fifo_clear(p);
+	if (!p->locked || (p->hdr.eotf &&
+	    time_after(jiffies, p->hdr_seen + msecs_to_jiffies(HDR_IF_TIMEOUT_MS))))
+		memset(&p->hdr, 0, sizeof(p->hdr));
+	hdmirx_hdr_info(p);
+}
+
 static void hdmirx_ctrl_config(struct hdmirx_port *p)
 {
 	/* controller 1.30a: the evaluation period counts md_clk cycles */
@@ -734,8 +850,12 @@ static void hdmirx_ctrl_config(struct hdmirx_port *p)
 	/* ours (not stock): MD_VOL reports the vertical front porch, see hdmirx_measure() */
 	ctrl_field(p, RA_MD_VCTRL, V_OFFS_LIN_MODE, 1);
 
-	/* packets; audio (muted until it is stable, hdmirx_audio_poll()) */
-	ctrl_wr(p, RA_PDEC_CTRL, PFIFO_STORE_FILTER_EN | PD_FIFO_WE | PDEC_BCH_EN);
+	/*
+	 * packets: HDR infoframes into the FIFO (hdmirx_hdr_poll()); audio (muted
+	 * until it is stable, hdmirx_audio_poll())
+	 */
+	ctrl_wr(p, RA_PDEC_CTRL, PFIFO_STORE_FILTER_EN | PFIFO_STORE_HDR | PD_FIFO_WE |
+		PDEC_BCH_EN);
 	ctrl_wr(p, RA_PDEC_ASP_CTRL, AUTO_VMUTE | AUTO_SPFLAT_MUTE);
 	hdmirx_audio_config(p);
 	ctrl_wr(p, RA_PDEC_CTRL, ctrl_rd(p, RA_PDEC_CTRL) | PD_FIFO_FILL_INFO_CLR | PD_FIFO_CLR);
@@ -860,8 +980,14 @@ static void hdmirx_track_signal(struct hdmirx_port *p)
 		p->sig_settled = false;
 		return;
 	}
-	if (p->sig_settled)
+	if (p->sig_settled) {
+		/* the HDR metadata can change on its own */
+		if (p->sig.locked && memcmp(&p->hdr, &p->sig.hdr, sizeof(p->hdr))) {
+			p->sig.hdr = p->hdr;
+			p->sig_changed = true;
+		}
 		return;
+	}
 	p->sig_settled = true;
 
 	if (p->locked && !hdmirx_measure(p, &sig.timings)) {
@@ -874,6 +1000,7 @@ static void hdmirx_track_signal(struct hdmirx_port *p)
 		}
 		dcm = FIELD_GET(DCM_CURRENT_MODE, ctrl_rd(p, RA_HDMI_STS));
 		sig.bpc = dcm == 5 ? 10 : dcm == 6 ? 12 : dcm == 7 ? 16 : 8;
+		sig.hdr = p->hdr;
 	}
 	if (memcmp(&sig, &p->sig, sizeof(sig))) {
 		p->sig = sig;
@@ -891,20 +1018,100 @@ static int hdmirx_port_connector(struct lg1314_hdmirx *rx, unsigned int port)
 	return 0;
 }
 
-static void hdmirx_report(struct hdmirx_port *p)
+static void hdmirx_report_connector(struct lg1314_hdmirx *rx, int k)
 {
-	struct lg1314_hdmirx *rx = p->rx;
-	int k = hdmirx_port_connector(rx, p->id);
 	char env[16], attr[8], *envp[] = { env, NULL };
 
-	if (!k)
-		return;
 	snprintf(env, sizeof(env), "HDMI=%d", k);
 	blocking_notifier_call_chain(&rx->notifier, k, NULL);
 	kobject_uevent_env(&rx->dev->kobj, KOBJ_CHANGE, envp);
 	/* for poll(POLLPRI) on the status file */
 	snprintf(attr, sizeof(attr), "hdmi%d", k);
 	sysfs_notify(&rx->dev->kobj, NULL, attr);
+}
+
+/* Part i of a split picture: the port of connector HDMI i + 1. */
+static bool hdmirx_split_part(struct lg1314_hdmirx *rx, unsigned int port)
+{
+	unsigned int k = rx->split_conn, i;
+
+	for (i = 0; k && i < rx->split[k - 1]; i++)
+		if (rx->connector_port[i] == port)
+			return true;
+	return false;
+}
+
+static void hdmirx_report(struct hdmirx_port *p)
+{
+	struct lg1314_hdmirx *rx = p->rx;
+	int k = hdmirx_port_connector(rx, p->id);
+
+	if (k)
+		hdmirx_report_connector(rx, k);
+	if (rx->split_conn && rx->split_conn != k && hdmirx_split_part(rx, p->id))
+		hdmirx_report_connector(rx, rx->split_conn);
+}
+
+/*
+ * Over how many receiver ports the switch spreads connector @k's picture: the
+ * switch's full width over the width the first part's port measures, when that
+ * is 2 or 4 (the switch's own split report misses some modes); else its report.
+ */
+static unsigned int hdmirx_connector_split(struct lg1314_hdmirx *rx, unsigned int k)
+{
+	int port = rx->connector_port[k - 1], first = rx->connector_port[0];
+	unsigned int full, part = 0, n;
+	struct hdmirx_port *p;
+
+	if (!rx->sw || port < 0)
+		return 1;
+	full = lg_hawk2_width(rx->sw, port);
+	if (first >= 0) {
+		p = &rx->port[first];
+		mutex_lock(&p->lock);
+		if (p->sig.locked)
+			part = p->sig.timings.bt.width;
+		mutex_unlock(&p->lock);
+	}
+	if (full && part && (full == 2 * part || full == 4 * part))
+		return full / part;
+	if (full && part && full == part)
+		return 1;
+	n = lg_hawk2_split(rx->sw, port);
+	return n <= LG1314_HDMIRX_CONNECTORS ? n : 1;
+}
+
+/*
+ * Follow the switch's split of each connector's picture. A change is reported for
+ * the connector and for those whose ports the split borrows (their status).
+ */
+static void hdmirx_track_split(struct lg1314_hdmirx *rx)
+{
+	unsigned int k, i, n, owner = 0, old_owner = rx->split_conn;
+	unsigned int old_n = old_owner ? rx->split[old_owner - 1] : 1;
+	bool changed = false;
+
+	for (k = 1; k <= LG1314_HDMIRX_CONNECTORS; k++) {
+		n = hdmirx_connector_split(rx, k);
+		if (n > 1 && !owner)
+			owner = k;
+		if (n != rx->split[k - 1]) {
+			dev_info(rx->dev, "HDMI %u: picture over %u receiver port%s\n", k, n,
+				 n > 1 ? "s" : "");
+			WRITE_ONCE(rx->split[k - 1], n);
+			changed = true;
+		}
+	}
+	WRITE_ONCE(rx->split_conn, owner);
+	if (!changed && owner == old_owner)
+		return;
+	n = max(old_n, owner ? rx->split[owner - 1] : 1);
+	for (i = 0; i < n; i++)
+		hdmirx_report_connector(rx, i + 1);
+	if (old_owner > n)
+		hdmirx_report_connector(rx, old_owner);
+	if (owner > n && owner != old_owner)
+		hdmirx_report_connector(rx, owner);
 }
 
 static void hdmirx_report_audio(struct hdmirx_port *p)
@@ -949,6 +1156,7 @@ static void hdmirx_poll_port(struct hdmirx_port *p)
 		hdmirx_phy_update(p);
 	if (!p->locked)
 		p->out_format = -1;
+	hdmirx_hdr_poll(p);
 	hdmirx_track_signal(p);
 	hdmirx_audio_poll(p);
 	if (p->muted && p->sig.locked &&
@@ -974,6 +1182,17 @@ static void hdmirx_poll(struct work_struct *work)
 	if (!rx->started) {
 		/* end of the HPD-low period: isolation off (stock does it again here) */
 		gpiod_set_value_cansleep(rx->isol, 1);
+		/*
+		 * Stock's ENABLE_OPERATION, after the isolation release: "ALED HPD set
+		 * up" on every port. Without it the HDMI switch sees no HPD from the
+		 * receivers and sends them nothing. The bit survives a watchdog reset,
+		 * not a power cycle.
+		 */
+		for (i = 0; i < HDMIRX_PORTS; i++) {
+			void __iomem *r = rx->aled_port + ALED_PORT_SIZE * i + ALED_AD_HPD;
+
+			writel(readl(r) | ALED_AD_HPD_SET_HPD, r);
+		}
 		rx->started = true;
 	}
 	/* stock's watchdog on the ALED I2C clock select */
@@ -981,6 +1200,7 @@ static void hdmirx_poll(struct work_struct *work)
 		writel(6, rx->aled + ALED_I2C_CLK_SEL);
 	for (i = 0; i < HDMIRX_PORTS; i++)
 		hdmirx_poll_port(&rx->port[i]);
+	hdmirx_track_split(rx);
 	schedule_delayed_work(&rx->poll, msecs_to_jiffies(HDMIRX_POLL_MS));
 }
 
@@ -1275,12 +1495,16 @@ EXPORT_SYMBOL_GPL(lg1314_hdmirx_select);
  */
 int lg1314_hdmirx_selected_audio(struct lg1314_hdmirx *rx, struct lg1314_hdmirx_audio *aud)
 {
-	int port = lg1314_hdmirx_connector_port(rx, READ_ONCE(rx->selected));
+	unsigned int k = READ_ONCE(rx->selected);
+	int port = lg1314_hdmirx_connector_port(rx, k);
 	struct hdmirx_port *p;
 	bool live;
 
 	if (port < 0)
 		return -ENODATA;
+	/* split: the audio comes with the first part (API_VIDEO_HDMI_GetAudioPortInfo) */
+	if (READ_ONCE(rx->split[k - 1]) > 1)
+		port = rx->connector_port[0];
 	p = &rx->port[port];
 	mutex_lock(&p->lock);
 	*aud = p->aud;
@@ -1290,21 +1514,83 @@ int lg1314_hdmirx_selected_audio(struct lg1314_hdmirx *rx, struct lg1314_hdmirx_
 }
 EXPORT_SYMBOL_GPL(lg1314_hdmirx_selected_audio);
 
-int lg1314_hdmirx_get_signal(struct lg1314_hdmirx *rx, unsigned int connector,
-			     struct lg1314_hdmirx_signal *sig)
+static void hdmirx_port_signal(struct hdmirx_port *p, struct lg1314_hdmirx_signal *sig,
+			       bool *cable)
 {
-	int port = lg1314_hdmirx_connector_port(rx, connector);
-	struct hdmirx_port *p;
+	mutex_lock(&p->lock);
+	*sig = p->sig;
+	*cable = p->cable;
+	mutex_unlock(&p->lock);
+}
+
+/*
+ * What connector @k shows: its port's signal, or, while the switch splits its
+ * picture over n ports, the picture put together from them (each part must be
+ * locked with the same size and format; the rest is the first part's). A port borrowed by another
+ * connector's split reports no cable.
+ */
+static int hdmirx_connector_signal(struct lg1314_hdmirx *rx, unsigned int k,
+				   struct lg1314_hdmirx_signal *sig, bool *cable)
+{
+	int port = lg1314_hdmirx_connector_port(rx, k);
+	unsigned int owner = READ_ONCE(rx->split_conn), n, i;
+	struct v4l2_bt_timings *bt = &sig->timings.bt;
+	struct lg1314_hdmirx_signal part;
+	bool part_cable;
 
 	if (port < 0)
 		return port;
-	p = &rx->port[port];
-	mutex_lock(&p->lock);
-	*sig = p->sig;
-	mutex_unlock(&p->lock);
+	n = READ_ONCE(rx->split[k - 1]);
+	if (n <= 1) {
+		if (owner && owner != k && k <= READ_ONCE(rx->split[owner - 1])) {
+			memset(sig, 0, sizeof(*sig));
+			*cable = false;
+			return 0;
+		}
+		hdmirx_port_signal(&rx->port[port], sig, cable);
+		return 0;
+	}
+
+	hdmirx_port_signal(&rx->port[rx->connector_port[0]], sig, cable);
+	for (i = 1; sig->locked && i < n; i++) {
+		hdmirx_port_signal(&rx->port[rx->connector_port[i]], &part, &part_cable);
+		/* blanking is measured per port (+-2 px): compare the picture only */
+		if (!part.locked || part.format != sig->format || part.bpc != sig->bpc ||
+		    part.timings.bt.width != bt->width ||
+		    part.timings.bt.height != bt->height ||
+		    part.timings.bt.interlaced != bt->interlaced)
+			sig->locked = false;
+	}
+	if (!sig->locked) {
+		memset(sig, 0, sizeof(*sig));
+		return 0;
+	}
+	bt->width *= n;
+	bt->hfrontporch *= n;
+	bt->hsync *= n;
+	bt->hbackporch *= n;
+	bt->pixelclock *= n;
+	sig->split = n;
 	return 0;
 }
+
+int lg1314_hdmirx_get_signal(struct lg1314_hdmirx *rx, unsigned int connector,
+			     struct lg1314_hdmirx_signal *sig)
+{
+	bool cable;
+
+	return hdmirx_connector_signal(rx, connector, sig, &cable);
+}
 EXPORT_SYMBOL_GPL(lg1314_hdmirx_get_signal);
+
+/* The receiver port carrying part @i (from the left) of a split picture. */
+int lg1314_hdmirx_split_port(struct lg1314_hdmirx *rx, unsigned int i)
+{
+	if (i >= LG1314_HDMIRX_CONNECTORS)
+		return -EINVAL;
+	return rx->connector_port[i];
+}
+EXPORT_SYMBOL_GPL(lg1314_hdmirx_split_port);
 
 int lg1314_hdmirx_register_notifier(struct lg1314_hdmirx *rx, struct notifier_block *nb)
 {
@@ -1332,16 +1618,11 @@ static ssize_t hdmirx_status_show(struct device *dev, struct device_attribute *a
 	unsigned int k = attr->attr.name[4] - '0';
 	struct lg1314_hdmirx_signal sig;
 	const struct v4l2_bt_timings *bt = &sig.timings.bt;
-	int port = lg1314_hdmirx_connector_port(rx, k);
 	u64 tot, mhz;
 	bool cable;
 
-	if (port < 0)
+	if (hdmirx_connector_signal(rx, k, &sig, &cable))
 		return -ENODEV;
-	mutex_lock(&rx->port[port].lock);
-	cable = rx->port[port].cable;
-	sig = rx->port[port].sig;
-	mutex_unlock(&rx->port[port].lock);
 	if (!cable)
 		return sysfs_emit(buf, "disconnected\n");
 	if (!sig.locked)
@@ -1416,6 +1697,9 @@ static int hdmirx_probe(struct platform_device *pdev)
 	rx->dev = dev;
 	BLOCKING_INIT_NOTIFIER_HEAD(&rx->notifier);
 
+	rx->aled_port = devm_platform_ioremap_resource_byname(pdev, "aled-ports");
+	if (IS_ERR(rx->aled_port))
+		return PTR_ERR(rx->aled_port);
 	rx->aled = devm_platform_ioremap_resource_byname(pdev, "aled");
 	if (IS_ERR(rx->aled))
 		return PTR_ERR(rx->aled);
@@ -1448,8 +1732,10 @@ static int hdmirx_probe(struct platform_device *pdev)
 			goto err_i2c;
 		}
 	}
-	for (i = 0; i < LG1314_HDMIRX_CONNECTORS; i++)
+	for (i = 0; i < LG1314_HDMIRX_CONNECTORS; i++) {
 		rx->connector_port[i] = rx->sw ? lg_hawk2_connector_port(rx->sw, i + 1) : i;
+		rx->split[i] = 1;
+	}
 
 	for (i = 0; i < HDMIRX_PORTS; i++) {
 		struct hdmirx_port *p = &rx->port[i];

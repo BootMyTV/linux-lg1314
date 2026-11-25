@@ -29,10 +29,22 @@
 #define DE_CMD_CVI_CSAMPLE	0x37	/* LX_DE_CSAMPLE_MODE_T */
 #define DE_SRC_HDMI		6	/* LX_DE_IN_SRC_HDMI */
 
-/* CTOP CVI_SYN crg_cvi01: CVI0/1 clock = HDMI link A..D (window 0: CVI0 + CVI1) */
+/*
+ * CTOP CVI_SYN crg_cvi01: CVIn clock = HDMI link A..D. Window 0: CVI0 + CVI1 from
+ * one port; a split picture: CVI0..3 from its parts (05.50 DE_REG_M19_SetCviSrcType:
+ * 1x4 parts 0, 1, 2, 3; 1x2 parts 0, 1, 1).
+ */
 #define CVI_SYN_CRG_CVI01	0xc9302004
 #define CVI0_CLK_SEL		GENMASK(2, 0)
 #define CVI1_CLK_SEL		GENMASK(6, 4)
+#define CVI2_CLK_SEL		GENMASK(10, 8)
+#define CVI3_CLK_SEL		GENMASK(14, 12)
+
+/* LX_DE_CVI_SPLIT_MODE_T */
+#define DE_SPLIT_1X2		1
+#define DE_SPLIT_1X4		2
+
+#define INPUT_TNR_MS		250
 
 /* LX_DE_COLOR_STD_T */
 enum { DE_COLOR_601, DE_COLOR_709, DE_COLOR_RGB, DE_COLOR_RGBEX, DE_COLOR_XVYCC601,
@@ -54,8 +66,12 @@ struct de_cvi_src_type {
 	u32 input_src;		/* LX_DE_CVI_SRC_HDMI = 6 */
 	u32 cvd_color;
 	u8 game[4];
-	u32 split_bpp, split_mode;
-	u16 split_overlap, split_w, split_h, split_rate;
+	/* LX_DE_CVI_SPLIT_INFO_T, for a picture split over ports by the HDMI switch */
+	u32 split_bpp;		/* stock: always 1 */
+	u32 split_mode;		/* DE_SPLIT_* */
+	u16 split_overlap;	/* pixels; 0 */
+	u16 split_w, split_h;	/* the whole picture */
+	u16 split_rate;		/* 0.1 Hz */
 } __packed;
 static_assert(sizeof(struct de_cvi_src_type) == 0x5c);
 
@@ -88,10 +104,22 @@ static const u16 csc_709_lim[9] = { 0x0b70, 0x0126, 0x0368, 0xf9b3, 0x082d, 0xfe
 				    0xf894, 0xff40, 0x082d };
 static const u16 csc_709_full[9] = { 0x09d2, 0x00fd, 0x02ed, 0xfa98, 0x0706, 0xfe62,
 				     0xf99e, 0xff5d, 0x0706 };
+/* BT.2020 (non-constant luminance): gbr2y_n2020_lin / _lim */
+static const u16 csc_2020_lim[9] = { 0x0ad9, 0x00f3, 0x0434, 0xfa1a, 0x082f, 0xfdb7,
+				     0xf87a, 0xff58, 0x082f };
+static const u16 csc_2020_full[9] = { 0x094a, 0x00d0, 0x0399, 0xfaf3, 0x0702, 0xfe0b,
+				      0xf98f, 0xff70, 0x0702 };
 
 static bool input_is_rgb(const struct lg1314_hdmirx_signal *sig)
 {
 	return sig->dvi || sig->format == LG1314_HDMIRX_RGB;
+}
+
+/* AVI extended colorimetry BT.2020 (RGB or YCbCr; 5: constant luminance) */
+static bool input_is_2020(const struct lg1314_hdmirx_signal *sig)
+{
+	return !sig->dvi && sig->colorimetry == 3 &&
+	       (sig->ext_colorimetry == 5 || sig->ext_colorimetry == 6);
 }
 
 /* RGB quantisation: default is limited for CE formats (any VIC but 640x480), else full */
@@ -107,6 +135,7 @@ static bool input_rgb_limited(const struct lg1314_hdmirx_signal *sig)
 static void input_csc(const struct lg1314_hdmirx_signal *sig, struct de_cvi_csc *csc)
 {
 	bool sd = sig->timings.bt.height < 720;
+	bool bt2020 = input_is_2020(sig);
 
 	memset(csc, 0, sizeof(*csc));
 	csc->enable = 1;
@@ -115,9 +144,11 @@ static void input_csc(const struct lg1314_hdmirx_signal *sig, struct de_cvi_csc 
 		return;
 	}
 	if (input_rgb_limited(sig)) {
-		memcpy(csc->matrix, sd ? csc_601_lim : csc_709_lim, sizeof(csc->matrix));
+		memcpy(csc->matrix, bt2020 ? csc_2020_lim : sd ? csc_601_lim : csc_709_lim,
+		       sizeof(csc->matrix));
 	} else {
-		memcpy(csc->matrix, sd ? csc_601_full : csc_709_full, sizeof(csc->matrix));
+		memcpy(csc->matrix, bt2020 ? csc_2020_full : sd ? csc_601_full : csc_709_full,
+		       sizeof(csc->matrix));
 		csc->offset[3] = 64;
 	}
 	csc->offset[4] = 512;
@@ -131,7 +162,8 @@ static u32 input_de_color(const struct lg1314_hdmirx_signal *sig)
 
 	/* converted to YCbCr by the CVI (input_csc()) */
 	if (input_is_rgb(sig))
-		return bt->height < 720 ? DE_COLOR_601 : DE_COLOR_709;
+		return input_is_2020(sig) ? DE_COLOR_2020_NCL :
+		       bt->height < 720 ? DE_COLOR_601 : DE_COLOR_709;
 	switch (sig->colorimetry) {
 	case 1:
 		return DE_COLOR_601;
@@ -202,9 +234,31 @@ static int input_program(struct lg1314_drm *lg, unsigned int connector,
 	int port = lg1314_hdmirx_connector_port(lg->input.rx, connector);
 	u64 tot = (u64)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
 	u64 mhz = tot ? div64_u64(bt->pixelclock * 1000, tot) : 0;
-	u32 v;
-	int ret;
+	unsigned int split = sig->split > 1 ? sig->split : 1;
+	int part[4] = { };
+	u32 v, clk;
+	int ret, i;
 
+	if (split == 2 || split == 4) {
+		for (i = 0; i < split; i++) {
+			part[i] = lg1314_hdmirx_split_port(lg->input.rx, i);
+			if (part[i] < 0)
+				return part[i];
+		}
+		port = part[0];
+		/*
+		 * The CVI is told one port's width; for 1x4 the firmware doubles it
+		 * (two CVIs per scaler path).
+		 */
+		src.hsize = bt->width / split;
+		src.split_bpp = 1;
+		src.split_mode = split == 4 ? DE_SPLIT_1X4 : DE_SPLIT_1X2;
+		src.split_w = bt->width;
+		src.split_h = bt->height;
+		src.split_rate = div_u64(mhz, 100);
+	} else if (split != 1) {
+		return -EINVAL;
+	}
 	if (port < 0)
 		return port;
 
@@ -217,10 +271,20 @@ static int input_program(struct lg1314_drm *lg, unsigned int connector,
 	if (lg->input.shown)
 		lg1314_video_de_blank(lg, true);
 
-	/* CVI clocks from the HDMI link (the firmware selects the data) */
+	/* CVI clocks from the HDMI link(s) (the firmware selects the data) */
 	v = lg1314_rd(lg, CVI_SYN_CRG_CVI01);
-	v &= ~(CVI0_CLK_SEL | CVI1_CLK_SEL);
-	v |= FIELD_PREP(CVI0_CLK_SEL, port) | FIELD_PREP(CVI1_CLK_SEL, port);
+	if (split == 4) {
+		clk = FIELD_PREP(CVI0_CLK_SEL, part[0]) | FIELD_PREP(CVI1_CLK_SEL, part[1]) |
+		      FIELD_PREP(CVI2_CLK_SEL, part[2]) | FIELD_PREP(CVI3_CLK_SEL, part[3]);
+		v = (v & ~(CVI0_CLK_SEL | CVI1_CLK_SEL | CVI2_CLK_SEL | CVI3_CLK_SEL)) | clk;
+	} else if (split == 2) {
+		clk = FIELD_PREP(CVI0_CLK_SEL, part[0]) | FIELD_PREP(CVI1_CLK_SEL, part[1]) |
+		      FIELD_PREP(CVI2_CLK_SEL, part[1]);
+		v = (v & ~(CVI0_CLK_SEL | CVI1_CLK_SEL | CVI2_CLK_SEL)) | clk;
+	} else {
+		v &= ~(CVI0_CLK_SEL | CVI1_CLK_SEL);
+		v |= FIELD_PREP(CVI0_CLK_SEL, port) | FIELD_PREP(CVI1_CLK_SEL, port);
+	}
 	lg1314_wr(lg, CVI_SYN_CRG_CVI01, v);
 
 	ret = lg1314_video_de_source(lg, DE_SRC_HDMI, port, NULL, NULL);
@@ -241,11 +305,17 @@ static int input_program(struct lg1314_drm *lg, unsigned int connector,
 	if (ret)
 		return ret;
 
+	/* the block's registers again (the set-up resets some), both windows */
+	lg1314_hdr_reassert(lg);
+	lg1314_pe_tnr_off(lg);
+	mod_delayed_work(system_wq, &lg->input.tnr_work, msecs_to_jiffies(INPUT_TNR_MS));
+
 	lg->input.panel_hz = input_panel_hz(mhz);
 	lg1314_de_frame_lock(lg, lg->input.panel_hz);
-	drm_info(&lg->drm, "input HDMI %u: %ux%u%c %llu.%03llu Hz, colour %u, %u bit\n",
+	drm_info(&lg->drm, "input HDMI %u: %ux%u%c %llu.%03llu Hz, colour %u, %u bit%s\n",
 		 connector, bt->width, bt->height, bt->interlaced ? 'i' : 'p',
-		 mhz / 1000, mhz % 1000, src.color, sig->bpc);
+		 mhz / 1000, mhz % 1000, src.color, sig->bpc,
+		 split == 4 ? ", over 4 ports" : split == 2 ? ", over 2 ports" : "");
 	return lg1314_video_de_blank(lg, false);
 }
 
@@ -265,12 +335,32 @@ static void input_apply(struct lg1314_drm *lg)
 		lg->input.shown = false;
 		return;
 	}
-	if (lg->input.shown && !memcmp(&sig, &lg->input.sig, sizeof(sig)))
+	/* HDR metadata alone: no window set-up */
+	if (lg->input.shown && !memcmp(&sig, &lg->input.sig, offsetof(typeof(sig), hdr))) {
+		lg->input.sig.hdr = sig.hdr;
+		lg1314_hdr_set_input(lg, &sig.hdr);
 		return;
+	}
 	lg->input.sig = sig;
+	lg1314_hdr_set_input(lg, &sig.hdr);
 	lg->input.shown = !input_program(lg, k, &sig);
 	if (!lg->input.shown)
 		drm_err(&lg->drm, "input HDMI %u: window setup failed\n", k);
+}
+
+/*
+ * The firmware switches TNR back on after a CVI set-up, at a time of its own;
+ * while an input shows, keep it off (as each commit does for the video plane).
+ */
+static void input_tnr_work(struct work_struct *work)
+{
+	struct lg1314_drm *lg = container_of(to_delayed_work(work), struct lg1314_drm,
+					     input.tnr_work);
+
+	if (!READ_ONCE(lg->input.active))
+		return;
+	lg1314_pe_tnr_off(lg);
+	schedule_delayed_work(&lg->input.tnr_work, msecs_to_jiffies(INPUT_TNR_MS));
 }
 
 static void input_work(struct work_struct *work)
@@ -306,6 +396,7 @@ void lg1314_input_set(struct lg1314_drm *lg, unsigned int k)
 			lg1314_de_frame_lock(lg, lg1314_panel_hz(lg->refresh_mhz));
 		lg->input.panel_hz = 0;
 		lg->input.shown = false;
+		lg1314_hdr_release_input(lg);
 		drm_info(&lg->drm, "input off\n");
 	}
 	WRITE_ONCE(lg->input.active, k);
@@ -351,6 +442,7 @@ int lg1314_input_init(struct lg1314_drm *lg)
 {
 	mutex_init(&lg->input.lock);
 	INIT_WORK(&lg->input.work, input_work);
+	INIT_DELAYED_WORK(&lg->input.tnr_work, input_tnr_work);
 	lg->input.nb.notifier_call = input_notify;
 	lg->input.np = of_parse_phandle(lg->dev->of_node, "lge,hdmirx", 0);
 	if (!lg->input.np)
@@ -368,6 +460,8 @@ void lg1314_input_fini(struct lg1314_drm *lg)
 	if (lg->input.rx) {
 		lg1314_hdmirx_unregister_notifier(lg->input.rx, &lg->input.nb);
 		cancel_work_sync(&lg->input.work);
+		WRITE_ONCE(lg->input.active, 0);
+		cancel_delayed_work_sync(&lg->input.tnr_work);
 		lg1314_hdmirx_select(lg->input.rx, 0);
 		lg1314_hdmirx_put(lg->input.rx);
 		lg->input.rx = NULL;

@@ -18,4 +18,17 @@ int lg_hawk2_connector_port(struct lg_hawk2 *hw, unsigned int connector);
 /* Route @port to the SoC; -1: follow the port where 5V appeared last. */
 void lg_hawk2_select(struct lg_hawk2 *hw, int port);
 
+/*
+ * The number of SoC receiver ports the switch spreads the picture it receives on
+ * @port over (1, 2 or 4: left to right over the ports of connectors HDMI 1, 2, ...),
+ * for signals beyond one HDMI 2.0 receiver (4K100/120 over FRL).
+ */
+unsigned int lg_hawk2_split(struct lg_hawk2 *hw, int port);
+/*
+ * The active width of the picture the switch receives on @port (0: none). Its split
+ * report reads 0 for some FRL modes that are split all the same (2560x1440@120 over
+ * four ports), so the receiver driver compares this with what its ports measure.
+ */
+unsigned int lg_hawk2_width(struct lg_hawk2 *hw, int port);
+
 #endif

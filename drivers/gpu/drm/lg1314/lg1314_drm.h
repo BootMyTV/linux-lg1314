@@ -367,6 +367,16 @@ struct lg1314_drm {
 		bool			applied;
 		u32			blob_id;
 		struct mutex		lock;	/* the tone slot */
+		/*
+		 * Whose metadata drives the block: the commit's (Kodi's video), or
+		 * while an HDMI input shows, the source's infoframe. src_lock
+		 * orders the two (taken before lock).
+		 */
+		struct mutex		src_lock;
+		bool			input;		/* an input owns it */
+		struct hdr_metadata_infoframe input_md;	/* applied for it */
+		bool			commit_md_set;
+		struct hdr_metadata_infoframe commit_md;	/* the last commit's */
 		/* dynamic tone mapping (lg1314_hdr.c, per video tick) */
 		struct work_struct	dtm_work;
 		bool			dtm_on;	/* slot B holds a dynamic curve */
@@ -424,6 +434,7 @@ struct lg1314_drm {
 		struct drm_property	*prop;	/* CRTC "VIDEO_INPUT" */
 		struct notifier_block	nb;
 		struct work_struct	work;
+		struct delayed_work	tnr_work;	/* TNR kept off while shown */
 		struct mutex		lock;
 		unsigned int		active;	/* connector selected, 0 none */
 		bool			shown;	/* window set up for sig */
@@ -502,6 +513,11 @@ void lg1314_status_update(struct lg1314_drm *lg);
 int  lg1314_hdr_init_props(struct lg1314_drm *lg);
 void lg1314_hdr_edid(struct drm_connector *connector);
 void lg1314_hdr_commit(struct lg1314_drm *lg, struct drm_atomic_state *state);
+void lg1314_hdr_mirror(struct lg1314_drm *lg);
+void lg1314_hdr_reassert(struct lg1314_drm *lg);
+void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md);
+void lg1314_hdr_release_input(struct lg1314_drm *lg);
+void lg1314_pe_tnr_off(struct lg1314_drm *lg);
 int  lg1314_dovi_init(struct lg1314_drm *lg, int irq);
 int  lg1314_dovi_start(struct lg1314_drm *lg, unsigned int profile);
 void lg1314_dovi_stop(struct lg1314_drm *lg);

@@ -8,6 +8,7 @@
 
 #include <linux/types.h>
 #include <linux/videodev2.h>
+#include <drm/drm_mode.h>
 
 struct device_node;
 struct notifier_block;
@@ -34,6 +35,14 @@ struct lg1314_hdmirx_signal {
 	u8 rgb_quant;			/* AVI Q: 0 default, 1 limited, 2 full */
 	u8 vic;
 	u8 bpc;				/* 8, 10, 12, 16 */
+	/*
+	 * >1: the HDMI switch spreads the picture over this many receiver ports,
+	 * left to right (lg1314_hdmirx_split_port()); the timings are the whole
+	 * picture's.
+	 */
+	u8 split;
+	/* the source's HDR infoframe (CTA-861 DRM); eotf 0 (and all 0): none */
+	struct hdr_metadata_infoframe hdr;
 };
 
 enum lg1314_hdmirx_audio_type {
@@ -63,6 +72,8 @@ void lg1314_hdmirx_select(struct lg1314_hdmirx *rx, unsigned int connector);
 int lg1314_hdmirx_connector_port(struct lg1314_hdmirx *rx, unsigned int connector);
 int lg1314_hdmirx_get_signal(struct lg1314_hdmirx *rx, unsigned int connector,
 			     struct lg1314_hdmirx_signal *sig);
+/* The receiver port carrying part @i (0: leftmost) of a split picture. */
+int lg1314_hdmirx_split_port(struct lg1314_hdmirx *rx, unsigned int i);
 int lg1314_hdmirx_selected_audio(struct lg1314_hdmirx *rx, struct lg1314_hdmirx_audio *aud);
 
 /*
