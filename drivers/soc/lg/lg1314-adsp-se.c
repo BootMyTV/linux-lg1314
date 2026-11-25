@@ -167,6 +167,7 @@ struct adsp_se {
 	u32 rate_cnt, rate_gstc;	/* last readings */
 	u64 rate_frames, rate_ticks;	/* input frames, GSTC ticks since the start */
 	s64 rate_err;			/* frames produced - consumed, Q16 */
+	u32 src_fs;			/* the source's nominal rate (receiver) */
 	u32 rate_fs;			/* converter input rate now */
 	u64 rate_log_ticks;		/* when to log the loop's state next */
 	u32 hdmi_glue, hdmi_gain_uid;	/* branch 1's end: glue -> gain (DSP1) */
@@ -482,7 +483,8 @@ static int se_hdmi_set_fs(struct adsp_se *se, u32 fs)
 
 /*
  * The rate loop. The input delivers HDMIIN_FRAMES_PER_INT frames per interrupt at
- * the source's rate; the outputs consume HDMI_RATE on the system clock (GSTC; the
+ * the source's rate (nominally src_fs: 44.1 kHz, 48 kHz, ...); the outputs consume
+ * HDMI_RATE on the system clock (GSTC; the
  * speaker I2S counts exactly 3000 interrupts per 90000 ticks). The converter turns
  * in frames into in x HDMI_RATE / rate_fs out frames. rate_err tracks produced -
  * consumed since the start; the input rate is set to the source's measured rate
@@ -515,8 +517,8 @@ static void se_hdmi_rate_work(struct work_struct *work)
 	 * off the nominal rate (a stall, a source change) re-baseline as well.
 	 */
 	if (!se->rate_based ||
-	    abs((s64)in * GSTC_HZ - (s64)dticks * HDMI_RATE) >
-	    (s64)dticks * HDMI_RATE / 1000000 * HDMI_RATE_MAX_PPM) {
+	    abs((s64)in * GSTC_HZ - (s64)dticks * se->src_fs) >
+	    (s64)dticks * se->src_fs / 1000000 * HDMI_RATE_MAX_PPM) {
 		se->rate_based = true;
 		goto again;
 	}
@@ -529,14 +531,14 @@ static void se_hdmi_rate_work(struct work_struct *work)
 	fs = rate_q16 >> 16;
 	if (se->rate_err > 0)
 		fs++;				/* backlog: take more input per output */
-	fs = clamp_t(u32, fs, HDMI_RATE - HDMI_RATE / 1000, HDMI_RATE + HDMI_RATE / 1000);
+	fs = clamp_t(u32, fs, se->src_fs - se->src_fs / 1000, se->src_fs + se->src_fs / 1000);
 	se_hdmi_set_fs(se, fs);
 	if (se->rate_ticks >= se->rate_log_ticks) {
-		s64 ppm = div64_s64(((s64)rate_q16 - ((s64)HDMI_RATE << 16)) * 1000000,
-				    (s64)HDMI_RATE << 16);
+		s64 ppm = div64_s64(((s64)rate_q16 - ((s64)se->src_fs << 16)) * 1000000,
+				    (s64)se->src_fs << 16);
 
-		dev_info(adsp->dev, "HDMI audio: source clock %+lld ppm (converter %u Hz, level %+lld frames)\n",
-			 ppm, se->rate_fs, se->rate_err >> 16);
+		dev_info(adsp->dev, "HDMI audio: source clock %+lld ppm of %u Hz (converter %u Hz, level %+lld frames)\n",
+			 ppm, se->src_fs, se->rate_fs, se->rate_err >> 16);
 		se->rate_log_ticks += HDMI_RATE_LOG_S * GSTC_HZ;
 	}
 again:
@@ -555,7 +557,6 @@ static void se_hdmi_rate_start(struct adsp_se *se)
 	se->rate_err = 0;
 	se->rate_log_ticks = 30 * GSTC_HZ;	/* then every HDMI_RATE_LOG_S */
 	se->rate_based = false;
-	se->rate_fs = HDMI_RATE;
 	schedule_delayed_work(&se->rate_work, msecs_to_jiffies(HDMI_RATE_PERIOD_MS));
 }
 
@@ -577,9 +578,10 @@ static void se_hdmi_stop(struct adsp_se *se)
 /*
  * Play receiver port @port (0..3), or stop (-1): through branch 0 into the
  * speakers' mixer, or through branch 1 (@branch 1) to whichever output has
- * connected its end. The receiver must have its audio output unmuted for the port.
+ * connected its end. @rate: the source's sample rate (Hz; 0: 48 kHz), converted to
+ * HDMI_RATE. The receiver must have its audio output unmuted for the port.
  */
-int adsp_se_hdmi(struct adsp_se *se, int port, int branch)
+int adsp_se_hdmi(struct adsp_se *se, int port, int branch, u32 rate)
 {
 	static const u32 fmt[4] = { 0, 3, 0, 0 };	/* I2S, 24 bit */
 	u32 mode[3] = { 0, port, 0 }, en[2] = { MIX_PORT_HDMI, 1 };
@@ -589,7 +591,9 @@ int adsp_se_hdmi(struct adsp_se *se, int port, int branch)
 	if (!se || !se->hdmi || (branch && !se->hdmi_glue_used))
 		return -ENODEV;
 	mutex_lock(&se->lock);
-	if (port == se->hdmi_port && branch == se->hdmi_branch)
+	if (!rate)
+		rate = HDMI_RATE;
+	if (port == se->hdmi_port && branch == se->hdmi_branch && rate == se->src_fs)
 		goto out;
 	se_hdmi_stop(se);
 	se->hdmi_branch = branch;
@@ -598,7 +602,10 @@ int adsp_se_hdmi(struct adsp_se *se, int port, int branch)
 		goto out;
 
 	in = se_hdmi_branch[branch].in;
+	se->src_fs = rate;
 	ret = se_hdmi_set_gain(se, se->hdmi_gain);
+	if (!ret)
+		ret = se_hdmi_set_fs(se, rate);
 	if (!ret)
 		ret = se_cmd_on(se, HDMI_DSP, in, HDMI_CMD_SET_FMT, fmt, sizeof(fmt));
 	if (!ret)
@@ -611,7 +618,8 @@ int adsp_se_hdmi(struct adsp_se *se, int port, int branch)
 		se_hdmi_rate_start(se);
 	if (!ret) {
 		se->hdmi_port = port;
-		dev_info(se->adsp->dev, "HDMI audio: port %d (branch %d)\n", port, branch);
+		dev_info(se->adsp->dev, "HDMI audio: port %d (branch %d), %u Hz\n", port, branch,
+			 rate);
 	}
 out:
 	if (port < 0)

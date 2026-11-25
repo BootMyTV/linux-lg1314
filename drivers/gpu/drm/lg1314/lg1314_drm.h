@@ -374,6 +374,7 @@ struct lg1314_drm {
 		 */
 		struct mutex		src_lock;
 		bool			input;		/* an input owns it */
+		bool			input_2020;	/* its colorimetry is BT.2020 */
 		struct hdr_metadata_infoframe input_md;	/* applied for it */
 		bool			commit_md_set;
 		struct hdr_metadata_infoframe commit_md;	/* the last commit's */
@@ -515,7 +516,8 @@ void lg1314_hdr_edid(struct drm_connector *connector);
 void lg1314_hdr_commit(struct lg1314_drm *lg, struct drm_atomic_state *state);
 void lg1314_hdr_mirror(struct lg1314_drm *lg);
 void lg1314_hdr_reassert(struct lg1314_drm *lg);
-void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md);
+void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md,
+			  bool bt2020);
 void lg1314_hdr_release_input(struct lg1314_drm *lg);
 void lg1314_pe_tnr_off(struct lg1314_drm *lg);
 int  lg1314_dovi_init(struct lg1314_drm *lg, int irq);

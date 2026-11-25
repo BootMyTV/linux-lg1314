@@ -281,6 +281,7 @@ struct hdmirx_port {
 	bool hpd;
 	bool phy_up;			/* Rx_Initiate_Phy done for this connection */
 	bool ud;			/* PHY in 6G mode (TMDS bit clock ratio 1/40, scrambled) */
+	bool scdc_ud;			/* SCDC TMDS ratio as last read */
 	bool locked;
 	unsigned int nolock;		/* polls with TMDS but no lock */
 	int out_format;			/* TOP_OUT_* set for; -1: not yet */
@@ -435,14 +436,21 @@ static bool hdmirx_scdc_ud(struct hdmirx_port *p)
 	return ctrl_rd(p, RA_SCDC_REGS0) & SCDC_TMDS_RATIO_40;
 }
 
-/* HDMI20_PHY_M19A0_Rx_Initiate_Phy; the link main reset (LinkVideoReset(1)) before it */
-static int hdmirx_phy_init(struct hdmirx_port *p)
+/*
+ * HDMI20_PHY_M19A0_Rx_Initiate_Phy; the link main reset (LinkVideoReset(1)) before
+ * it. The main reset also clears the SCDC registers, so a TMDS ratio the source
+ * wrote before it is lost (the switch writes it once): the mode is taken from
+ * before the reset, and a retry after no lock (@retry) tries the other mode.
+ */
+static int hdmirx_phy_init(struct hdmirx_port *p, bool retry)
 {
+	bool ud = hdmirx_scdc_ud(p);
 	int ret;
 
 	hdmirx_link_reset(p, true);
 	hdmirx_mute(p, true);
-	p->ud = hdmirx_scdc_ud(p);
+	p->ud = retry ? !p->ud : ud || hdmirx_scdc_ud(p);
+	p->scdc_ud = hdmirx_scdc_ud(p);
 	p->locked = false;
 	p->nolock = 0;
 	ret = hdmirx_phy_ops(p, 0, ARRAY_SIZE(hdmirx_phy_seq), p->ud);
@@ -495,8 +503,12 @@ static void hdmirx_phy_update(struct hdmirx_port *p)
 	bool locked;
 	int tcs, cr, scdt;
 
-	if (hdmirx_scdc_ud(p) != p->ud)
-		hdmirx_phy_set_mode(p, !p->ud);
+	/* follow the source's SCDC writes (changes; our resets clear the register) */
+	if (hdmirx_scdc_ud(p) != p->scdc_ud) {
+		p->scdc_ud = !p->scdc_ud;
+		if (p->scdc_ud != p->ud)
+			hdmirx_phy_set_mode(p, p->scdc_ud);
+	}
 
 	tcs = phy_rd(p, 1, PHYB1_TCS_DONE);
 	if (tcs < 0)
@@ -532,7 +544,7 @@ static void hdmirx_phy_update(struct hdmirx_port *p)
 	if (locked || phy_rd(p, 0, PHY_TMDS_FREQ_MSB) <= 0)
 		p->nolock = 0;
 	else if (++p->nolock >= PHY_LOCK_RETRY_POLLS)
-		hdmirx_phy_init(p);
+		hdmirx_phy_init(p, true);
 }
 
 /* __HDMI20_HAL_Rx_Set_EnableHPD (not inverted) */
@@ -1088,11 +1100,19 @@ static unsigned int hdmirx_connector_split(struct lg1314_hdmirx *rx, unsigned in
 static void hdmirx_track_split(struct lg1314_hdmirx *rx)
 {
 	unsigned int k, i, n, owner = 0, old_owner = rx->split_conn;
+	unsigned int sel = READ_ONCE(rx->selected);
 	unsigned int old_n = old_owner ? rx->split[old_owner - 1] : 1;
 	bool changed = false;
 
 	for (k = 1; k <= LG1314_HDMIRX_CONNECTORS; k++) {
-		n = hdmirx_connector_split(rx, k);
+		/*
+		 * The switch routes (and splits) only the shown source. An
+		 * unselected FRL input is measured but not spread over the receiver
+		 * ports, so it must not own a split or borrow another connector's
+		 * port - else plugging a 4K120 source into an idle connector would
+		 * blank the one on display.
+		 */
+		n = k == sel ? hdmirx_connector_split(rx, k) : 1;
 		if (n > 1 && !owner)
 			owner = k;
 		if (n != rx->split[k - 1]) {
@@ -1139,7 +1159,7 @@ static void hdmirx_poll_port(struct hdmirx_port *p)
 		p->sig_changed = true;	/* the status file says "disconnected" or not */
 		if (cable) {
 			hdmirx_phy_power(p, true);
-			p->phy_up = !hdmirx_phy_init(p);
+			p->phy_up = !hdmirx_phy_init(p, false);
 		} else {
 			hdmirx_set_hpd(p, false);
 			ctrl_wr(p, RA_DMI_SW_RST, 0xffff);
@@ -1151,7 +1171,7 @@ static void hdmirx_poll_port(struct hdmirx_port *p)
 	if (p->cable && !p->hpd && p->edid_blocks)
 		hdmirx_set_hpd(p, true);
 	if (p->cable && !p->phy_up)
-		p->phy_up = !hdmirx_phy_init(p);
+		p->phy_up = !hdmirx_phy_init(p, false);
 	else if (p->cable)
 		hdmirx_phy_update(p);
 	if (!p->locked)

@@ -58,7 +58,7 @@ struct de_cvi_src_type {
 	u32 aspect;		/* 0 4:3, 1 16:9 */
 	u32 scan;		/* 0 interlaced, 1 progressive */
 	u32 bit_res;		/* 0 10 bit */
-	u32 c_sample;		/* 1 4:4:4 */
+	u32 c_sample;		/* LX_DE_CVI_CSAMPLE_T: 0 4:2:2, 1 4:4:4, 2 4:2:0 */
 	u32 de_mode;		/* 1 HDMI (CEA) */
 	u32 sampling;		/* 0 normal */
 	u32 sc_c_sample;	/* scaler: 0 4:2:0, 1 4:2:2, 2 4:4:4 */
@@ -155,6 +155,21 @@ static void input_csc(const struct lg1314_hdmirx_signal *sig, struct de_cvi_csc 
 	csc->offset[5] = 512;
 }
 
+/*
+ * The scaler's chroma sampling, as stock's colour-domain table (libkadaptor
+ * KADP_VP_GetCVICfg): the source's own (4:2:0, 4:2:2; RGB and 4:4:4 4:4:4),
+ * 4:4:4 only for progressive input. (Stock's "HDMI 4:4:4" picture setting can
+ * force 4:2:2 or 4:4:4; not modelled.)
+ */
+static u32 input_sc_sample(const struct lg1314_hdmirx_signal *sig)
+{
+	if (!input_is_rgb(sig) && sig->format == LG1314_HDMIRX_YCBCR420)
+		return 0;
+	if (!input_is_rgb(sig) && sig->format == LG1314_HDMIRX_YCBCR422)
+		return 1;
+	return sig->timings.bt.interlaced ? 1 : 2;
+}
+
 /* The colour standard the CVI is told, from the AVI infoframe. */
 static u32 input_de_color(const struct lg1314_hdmirx_signal *sig)
 {
@@ -224,13 +239,20 @@ static int input_program(struct lg1314_drm *lg, unsigned int connector,
 		.aspect = 1,
 		.scan = !bt->interlaced,
 		.bit_res = 0,
-		.c_sample = 1,
+		/*
+		 * 4:2:0 reaches the CVI as sent, two pixels per clock (half-width
+		 * lines): the firmware unpacks it when told 4:2:0, else it rejects the
+		 * source (sourceValid 0, black). As stock's KADP_VP_GetCVICfg: 4:2:0
+		 * when the scaler runs 4:2:0, else 4:4:4.
+		 */
+		.c_sample = sig->format == LG1314_HDMIRX_YCBCR420 ? 2 : 1,
 		.de_mode = 1,
 		.sampling = 0,
-		.sc_c_sample = 1,
+		.sc_c_sample = input_sc_sample(sig),
 		.input_src = 6,
 	};
-	struct { u32 channel, three_tap; } csample = { 0, 1 };
+	/* stock (KADP_DE_SetCviCsampleMode): 3-tap when the scaler runs 4:2:2 */
+	struct { u32 channel, three_tap; } csample = { 0, src.sc_c_sample == 1 };
 	int port = lg1314_hdmirx_connector_port(lg->input.rx, connector);
 	u64 tot = (u64)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
 	u64 mhz = tot ? div64_u64(bt->pixelclock * 1000, tot) : 0;
@@ -338,11 +360,11 @@ static void input_apply(struct lg1314_drm *lg)
 	/* HDR metadata alone: no window set-up */
 	if (lg->input.shown && !memcmp(&sig, &lg->input.sig, offsetof(typeof(sig), hdr))) {
 		lg->input.sig.hdr = sig.hdr;
-		lg1314_hdr_set_input(lg, &sig.hdr);
+		lg1314_hdr_set_input(lg, &sig.hdr, input_is_2020(&sig));
 		return;
 	}
 	lg->input.sig = sig;
-	lg1314_hdr_set_input(lg, &sig.hdr);
+	lg1314_hdr_set_input(lg, &sig.hdr, input_is_2020(&sig));
 	lg->input.shown = !input_program(lg, k, &sig);
 	if (!lg->input.shown)
 		drm_err(&lg->drm, "input HDMI %u: window setup failed\n", k);

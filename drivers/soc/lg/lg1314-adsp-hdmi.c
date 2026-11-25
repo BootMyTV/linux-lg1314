@@ -28,6 +28,7 @@ struct adsp_hdmi {
 	struct work_struct update;
 	unsigned int tries;
 	int port;			/* playing, -1: none */
+	u32 rate;			/* its sample rate */
 };
 
 static void adsp_hdmi_update(struct work_struct *work)
@@ -35,17 +36,20 @@ static void adsp_hdmi_update(struct work_struct *work)
 	struct adsp_hdmi *h = container_of(work, struct adsp_hdmi, update);
 	struct lg1314_hdmirx_audio aud;
 	int port = lg1314_hdmirx_selected_audio(h->rx, &aud);
+	u32 rate;
 
 	/* PCM for now; compressed / HBR streams need DSP0's decoders */
 	if (port >= 0 && aud.type != LG1314_HDMIRX_AUDIO_PCM)
 		port = -1;
 	if (port < 0)
 		port = -1;
-	if (port == h->port)
+	rate = port >= 0 && aud.rate ? aud.rate : 48000;
+	if (port == h->port && (port < 0 || rate == h->rate))
 		return;
-	if (adsp_pcm_hdmi(h->adsp, port) && port >= 0)
+	if (adsp_pcm_hdmi(h->adsp, port, rate) && port >= 0)
 		port = -1;
 	h->port = port;
+	h->rate = rate;
 }
 
 static int adsp_hdmi_notify(struct notifier_block *nb, unsigned long connector, void *data)
@@ -107,7 +111,7 @@ void adsp_hdmi_exit(struct lg1314_adsp *adsp)
 		lg1314_hdmirx_unregister_notifier(h->rx, &h->nb);
 		cancel_work_sync(&h->update);
 		if (h->port >= 0)
-			adsp_pcm_hdmi(adsp, -1);
+			adsp_pcm_hdmi(adsp, -1, 0);
 		lg1314_hdmirx_put(h->rx);
 	}
 	of_node_put(h->np);

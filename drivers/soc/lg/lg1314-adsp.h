@@ -271,14 +271,14 @@ int adsp_se_attach(struct adsp_se *se, struct adsp_shbuf *sb);
 int adsp_se_start(struct adsp_se *se);
 void adsp_se_free(struct adsp_se *se);
 int adsp_se_add_controls(struct snd_soc_component *c, struct adsp_se *se);
-int adsp_se_hdmi(struct adsp_se *se, int port, int branch);
+int adsp_se_hdmi(struct adsp_se *se, int port, int branch, u32 rate);
 u32 adsp_se_hdmi_out(struct adsp_se *se);
 int adsp_se_hdmi_attach(struct adsp_se *se);
 
 /* lg1314-adsp-pcm.c */
 int adsp_pcm_init(struct lg1314_adsp *adsp);
 void adsp_pcm_exit(struct lg1314_adsp *adsp);
-int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port);
+int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port, u32 rate);
 
 /* lg1314-adsp-hdmi.c */
 void adsp_hdmi_init(struct lg1314_adsp *adsp);

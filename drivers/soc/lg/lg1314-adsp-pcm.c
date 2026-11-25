@@ -102,6 +102,7 @@ struct adsp_pcm {
 	struct mutex hdmi_lock;		/* the HDMI routing below */
 	int hdmi_target;		/* output for the HDMI input (control) */
 	int hdmi_port;			/* receiver port playing, -1: none */
+	u32 hdmi_rate;			/* its sample rate (Hz) */
 	int hdmi_on;			/* output playing it, -1: none */
 	u32 hdmi_out;			/* the HDMI branch's end (a gain) */
 };
@@ -611,11 +612,12 @@ static int adsp_pcm_hdmi_route(struct lg1314_adsp *adsp)
 	ret = on > OUT_SPEAKER && pcm->hdmi_on != on ?
 	      adsp_out_hdmi_attach(t, pcm->hdmi_out) : 0;
 	if (!ret)
-		ret = adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, port, on > OUT_SPEAKER);
+		ret = adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, port, on > OUT_SPEAKER,
+				   pcm->hdmi_rate);
 	if (ret && on > OUT_SPEAKER)
 		adsp_out_hdmi_detach(t, pcm->hdmi_out);
 	if (ret) {
-		adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, -1, 0);
+		adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, -1, 0, 0);
 		port = -1;
 		on = -1;
 		t = NULL;
@@ -634,8 +636,11 @@ static int adsp_pcm_hdmi_route(struct lg1314_adsp *adsp)
 	return ret;
 }
 
-/* HDMI receiver port @port (-1: none) plays, on the output the control selects. */
-int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port)
+/*
+ * HDMI receiver port @port (-1: none) plays, at @rate Hz, on the output the control
+ * selects.
+ */
+int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port, u32 rate)
 {
 	struct adsp_pcm *pcm = adsp->pcm;
 	int ret;
@@ -644,6 +649,7 @@ int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port)
 		return -ENODEV;
 	mutex_lock(&pcm->hdmi_lock);
 	pcm->hdmi_port = port;
+	pcm->hdmi_rate = rate;
 	ret = adsp_pcm_hdmi_route(adsp);
 	mutex_unlock(&pcm->hdmi_lock);
 	return ret;

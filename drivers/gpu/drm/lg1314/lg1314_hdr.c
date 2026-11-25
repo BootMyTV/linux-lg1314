@@ -1203,7 +1203,9 @@ static int wcg_want(struct lg1314_drm *lg)
 		return -1;
 	if (READ_ONCE(lg->dovi.active))
 		return WCG_IDENTITY;
-	return READ_ONCE(lg->hdr.hdr10) || READ_ONCE(lg->hdr.hlg) ?
+	/* SDR in BT.2020 colorimetry too (e.g. an Android TV box's UI) */
+	return READ_ONCE(lg->hdr.hdr10) || READ_ONCE(lg->hdr.hlg) ||
+	       (READ_ONCE(lg->hdr.input) && READ_ONCE(lg->hdr.input_2020)) ?
 	       WCG_BT2020 : WCG_BT709;
 }
 
@@ -1367,13 +1369,16 @@ out:
 
 /*
  * An HDMI input shows: its HDR infoframe (eotf 0: SDR) drives the block, as a
- * commit's metadata does for video. Applied when it changes.
+ * commit's metadata does for video. Applied when it changes. @bt2020: the AVI
+ * colorimetry is BT.2020 (picks the gamut LUT, SDR included).
  */
-void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md)
+void lg1314_hdr_set_input(struct lg1314_drm *lg, const struct hdr_metadata_infoframe *md,
+			  bool bt2020)
 {
 	if (!lg->hdr.fw)
 		return;
 	mutex_lock(&lg->hdr.src_lock);
+	WRITE_ONCE(lg->hdr.input_2020, bt2020);
 	if (!lg->hdr.input || memcmp(md, &lg->hdr.input_md, sizeof(*md))) {
 		lg->hdr.input = true;
 		lg->hdr.input_md = *md;
