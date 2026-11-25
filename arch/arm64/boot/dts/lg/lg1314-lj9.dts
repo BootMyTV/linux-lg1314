@@ -7,6 +7,7 @@
 
 /memreserve/ 0x0000000000000000 0x0000000000001000;
 
+#include <dt-bindings/gpio/gpio.h>
 #include "lg1314.dtsi"
 
 / {
@@ -113,9 +114,10 @@
 
 		/*
 		 * Video decoder: overflow for decoded pictures (and the Dolby
-		 * Vision enhancement layer's), in three pieces around the boot
-		 * scanout and the boot ROM's retention area. The display
-		 * firmware is given their span as its second video pool.
+		 * Vision enhancement layer's), in four pieces around the boot
+		 * scanout, the audio DSPs' memory and the boot ROM's retention
+		 * area. The display firmware is given their span as its second
+		 * video pool.
 		 */
 		vdec_shared0: vdec-shared@77100000 {
 			reg = <0x77100000 0x01500000>;
@@ -129,7 +131,22 @@
 		};
 
 		vdec_shared1: vdec-shared@78e00000 {
-			reg = <0x78e00000 0x05ae0000>;
+			reg = <0x78e00000 0x02480000>;
+			no-map;
+		};
+
+		/*
+		 * Audio DSPs: stock's layout (MS12 2.0) at stock's address: DSP0
+		 * 26 MiB, DSP1 15 MiB (images in their tops), sound engine 2 MiB,
+		 * IPC rings 1 MiB, buffer controllers, then the buffer pool.
+		 */
+		adsp_mem: adsp@7b280000 {
+			reg = <0x7b280000 0x03460000>;
+			no-map;
+		};
+
+		vdec_shared3: vdec-shared@7e6e0000 {
+			reg = <0x7e6e0000 0x00200000>;
 			no-map;
 		};
 
@@ -182,11 +199,11 @@
 		memory-region = <&gfx_surface>, <&de_fw>, <&de_fw_m0>, <&de_prew>,
 				<&de_hdr>, <&de_frm>, <&de_vt>, <&kdrv_be>,
 				<&vdec_dpb>, <&vdec_shared0>, <&vdec_shared1>,
-				<&vdec_shared2>;
+				<&vdec_shared3>, <&vdec_shared2>;
 		memory-region-names = "scanout", "de-fw", "de-fw-m0", "de-prew",
 				      "de-hdr", "de-frm", "de-vt", "be",
 				      "vdec-dpb", "vdec-shared", "vdec-shared",
-				      "vdec-shared";
+				      "vdec-shared", "vdec-shared";
 		/* Model word for the DE firmware (from the board's hwopt). */
 		lge,de-model = <0x00020001>;
 		lge,micom = <&micom>;
@@ -201,9 +218,203 @@
 	vdec: vdec {
 		compatible = "lge,lg1314-vdec";
 		memory-region = <&vdec_mcu>, <&vdec_dpb>, <&vdec_shared0>,
-				<&vdec_shared1>, <&vdec_shared2>;
-		memory-region-names = "mcu", "dpb", "shared", "shared", "shared";
+				<&vdec_shared1>, <&vdec_shared3>, <&vdec_shared2>;
+		memory-region-names = "mcu", "dpb", "shared", "shared", "shared",
+				      "shared";
 		interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	adsp: audio-dsp@c9a00000 {
+		compatible = "lge,lg1314-adsp";
+		/*
+		 * audio block, AUD_SYN memory flush, the audio bus port's
+		 * protector, audio clocks (BMC_SYN + CTOP_BMC)
+		 */
+		reg = <0xc9a00000 0x3000>,
+		      <0xc9c60c00 0x200>,
+		      <0xc9822600 0x100>,
+		      <0xc930e000 0x430>;
+		reg-names = "aud", "syn", "mpro", "bmc";
+		/* DSP0 -> host, DSP1 -> host */
+		interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+		memory-region = <&adsp_mem>;
+
+		/* DSP1's outputs: one DAI each */
+		adsp_speaker: speaker {
+			#sound-dai-cells = <0>;
+
+			/* I2S to the amplifiers; the SoC drives the clocks */
+			port {
+				bitclock-master;
+				frame-master;
+				adsp_spk_ep: endpoint {
+					remote-endpoint = <&spk_mcpu1_ep>;
+				};
+			};
+		};
+
+		adsp_spdif: spdif {
+			#sound-dai-cells = <0>;
+
+			adsp_spdif_port: port {
+				adsp_spdif_ep: endpoint {
+					remote-endpoint = <&spdif_tx_ep>;
+				};
+			};
+		};
+
+		/* "sub" I2S to the internal DAC */
+		adsp_headphones: headphones {
+			#sound-dai-cells = <0>;
+
+			adsp_hp_port: port {
+				bitclock-master;
+				frame-master;
+				adsp_hp_ep: endpoint {
+					remote-endpoint = <&acodec_ep>;
+				};
+			};
+		};
+	};
+
+	/* Internal DAC: headphone / line out. */
+	acodec: audio-codec@c910c300 {
+		compatible = "lge,lg1314-acodec";
+		/* MIP_DIG DAC, CTOP_BMC analogue, BMC_SYN audio reset (shared) */
+		reg = <0xc910c300 0x64>,
+		      <0xc930e470 0x18>,
+		      <0xc930e004 0x4>;
+		reg-names = "dac", "atop", "reset";
+		#sound-dai-cells = <0>;
+		/* after the DAC: the MICOM's headphone mute; stock GPIO 22 = plugged */
+		mute-gpios = <&micom 0 GPIO_ACTIVE_HIGH>;
+		hp-det-gpios = <&gpio2 6 GPIO_ACTIVE_HIGH>;
+
+		port {
+			acodec_ep: endpoint {
+				format = "i2s";
+				remote-endpoint = <&adsp_hp_ep>;
+			};
+		};
+	};
+
+	sound-headphones {
+		compatible = "audio-graph-card2";
+		label = "Headphones";
+		links = <&adsp_hp_port>;
+	};
+
+	spdif_tx: spdif-tx {
+		compatible = "linux,spdif-dit";
+		#sound-dai-cells = <0>;
+
+		port {
+			spdif_tx_ep: endpoint {
+				remote-endpoint = <&adsp_spdif_ep>;
+			};
+		};
+	};
+
+	sound-optical {
+		compatible = "audio-graph-card2";
+		label = "Optical";
+		links = <&adsp_spdif_port>;
+	};
+
+	/* Speakers: one stereo stream into both amplifiers. */
+	sound-speakers {
+		compatible = "audio-graph-card2";
+		label = "Speakers";
+		links = <&spk_mcpu>;
+
+		multi {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			ports@0 {
+				reg = <0>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				spk_mcpu: port@0 {
+					reg = <0>;
+					spk_mcpu0_ep: endpoint {
+						remote-endpoint = <&spk_mcodec0_ep>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					spk_mcpu1_ep: endpoint {
+						remote-endpoint = <&adsp_spk_ep>;
+					};
+				};
+			};
+
+			ports@1 {
+				reg = <1>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					spk_mcodec0_ep: endpoint {
+						remote-endpoint = <&spk_mcpu0_ep>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					spk_mcodec1_ep: endpoint {
+						remote-endpoint = <&amp_front_ep>;
+					};
+				};
+				port@2 {
+					reg = <2>;
+					spk_mcodec2_ep: endpoint {
+						remote-endpoint = <&amp_woofer_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * Speaker amplifiers: both take the same I2S stereo pair (DSP1's speaker
+ * output) and split the bands with their own EQ. One reset line for both
+ * (stock GPIO 23).
+ */
+&i2c0 {
+	amp_front: audio-codec@2a {
+		compatible = "neofidelity,ntp7519";
+		reg = <0x2a>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+		firmware-name = "lg1314/ntp7519-front.bin";
+		sound-name-prefix = "Main Amp";
+
+		port {
+			amp_front_ep: endpoint {
+				format = "i2s";
+				remote-endpoint = <&spk_mcodec1_ep>;
+			};
+		};
+	};
+
+	amp_woofer: audio-codec@2b {
+		compatible = "neofidelity,ntp7519";
+		reg = <0x2b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+		firmware-name = "lg1314/ntp7519-woofer.bin";
+		sound-name-prefix = "Woofer Amp";
+
+		port {
+			amp_woofer_ep: endpoint {
+				format = "i2s";
+				remote-endpoint = <&spk_mcodec2_ep>;
+			};
+		};
 	};
 };
 
@@ -211,6 +422,10 @@
 	micom: micom@29 {
 		compatible = "lge,lg1314-micom";
 		reg = <0x29>;
+		/* output ports (gpio-lg1314-micom) */
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-line-names = "HP_MUTE";
 	};
 };
 

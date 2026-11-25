@@ -780,7 +780,7 @@
 				      <&pinctrl 6 142 1>, <&pinctrl 7 143 1>;
 		};
 
-		i2c@fe300000 {
+		i2c0: i2c@fe300000 {
 			compatible = "lge,lg1k-i2c";
 			reg = <0xfe300000 0x1000>;
 			interrupts = <GIC_SPI 26 IRQ_TYPE_LEVEL_HIGH>;

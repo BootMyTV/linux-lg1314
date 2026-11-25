@@ -602,6 +602,12 @@ static int graph_parse_node_multi(struct simple_util_priv *priv,
 	int nm_max = max(dai_link->num_cpus, dai_link->num_codecs);
 
 	/*
+	 * graph_get_next_multi_ep() drops the reference of the port it steps
+	 * from, but the caller still owns (and puts) this one.
+	 */
+	of_node_get(port);
+
+	/*
 	 * create ch_maps if CPU:Codec = N:M
 	 * DPCM is out of scope
 	 */
@@ -651,6 +657,7 @@ static int graph_parse_node_multi(struct simple_util_priv *priv,
 		ret = -EINVAL;
 
 multi_err:
+	of_node_put(port);	/* NULL once all ports were walked */
 	return graph_ret(priv, ret);
 }
 

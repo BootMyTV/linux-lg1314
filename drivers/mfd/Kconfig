@@ -1660,8 +1660,8 @@ config MFD_LG1314_MICOM
 	help
 	  Support for the standby microcontroller (MICOM) of LG1314-based
 	  TVs, on I2C. The core driver switches the on-board Wi-Fi/Bluetooth
-	  combo's power and reset; the MICOM's functions (RTC, IR power key)
-	  are child devices with their own drivers.
+	  combo's power and reset; the MICOM's functions (RTC, IR power key,
+	  output ports as GPIOs) are child devices with their own drivers.
 
 config MFD_LP3943
 	tristate "TI/National Semiconductor LP3943 MFD Driver"

@@ -109,6 +109,7 @@ static void micom_combo_cycle_work(struct work_struct *work)
 static const struct mfd_cell lg1314_micom_cells[] = {
 	{ .name = "lg1314-micom-rtc" },
 	{ .name = "lg1314-micom-pwrkey" },
+	{ .name = "lg1314-micom-gpio" },
 };
 
 static int lg1314_micom_probe(struct i2c_client *client)

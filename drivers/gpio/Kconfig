@@ -1451,6 +1451,13 @@ config GPIO_LJCA
 	  This driver can also be built as a module. If so, the module
 	  will be called gpio-ljca.
 
+config GPIO_LG1314_MICOM
+	tristate "LG1314 standby MICOM output ports"
+	depends on MFD_LG1314_MICOM
+	help
+	  GPIO lines for the output ports of the standby microcontroller of
+	  LG1314-based TVs (e.g. the headphone mute).
+
 config GPIO_LP3943
 	tristate "TI/National Semiconductor LP3943 GPIO expander"
 	depends on MFD_LP3943
