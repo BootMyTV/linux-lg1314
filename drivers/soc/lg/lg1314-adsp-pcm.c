@@ -67,6 +67,7 @@ struct adsp_out_desc {
 	const char *pcm_name;		/* what players show next to the card */
 	const char *module;
 	unsigned int slots;		/* s32 per frame */
+	bool hdmi;			/* can take the HDMI input */
 	int (*setup)(struct adsp_out *o);
 	void (*teardown)(struct adsp_out *o);
 };
@@ -77,7 +78,11 @@ struct adsp_out {
 	int index;
 	struct platform_device *pdev;	/* DAI + PCM component */
 	u32 glue, mod;
+	u32 mixer;			/* host glue (in 0), HDMI (in 1) -> output */
 	struct adsp_se *se;		/* speakers through the sound engine */
+	struct snd_soc_component *component;
+	bool hold;			/* codecs unmuted without a stream (HDMI audio) */
+	struct work_struct hold_work;
 	unsigned int slots;		/* s32 per frame in the shared buffer */
 	struct adsp_shbuf *sb;
 	struct work_struct fill_work;
@@ -94,6 +99,11 @@ struct adsp_out {
 struct adsp_pcm {
 	struct workqueue_struct *wq;
 	struct adsp_out out[OUT_NUM];
+	struct mutex hdmi_lock;		/* the HDMI routing below */
+	int hdmi_target;		/* output for the HDMI input (control) */
+	int hdmi_port;			/* receiver port playing, -1: none */
+	int hdmi_on;			/* output playing it, -1: none */
+	u32 hdmi_out;			/* the HDMI branch's end (a gain) */
 };
 
 static int adsp_spdif_setup(struct adsp_out *o)
@@ -127,10 +137,12 @@ static const struct adsp_out_desc adsp_outs[OUT_NUM] = {
 		.node = "spdif", .pcm_name = "S/PDIF",
 		.module = "output_spdif", .slots = 2,
 		.setup = adsp_spdif_setup, .teardown = adsp_spdif_teardown,
+		.hdmi = true,
 	},
 	[OUT_HP] = {
 		.node = "headphones", .pcm_name = "Analog",
 		.module = "output_hp", .slots = 2,
+		.hdmi = true,
 	},
 };
 
@@ -288,11 +300,56 @@ static int adsp_out_construct(struct snd_soc_component *c, struct snd_soc_pcm_ru
 	return 0;
 }
 
+/*
+ * Keep the output's codecs (the speaker amps) unmuted while something plays
+ * through the DSP without an ALSA stream (HDMI audio), and muted again after,
+ * unless a stream is running then. ASoC mutes them when a stream ends, before
+ * the component's hw_free, which queues this again.
+ */
+static void adsp_out_hold_work(struct work_struct *work)
+{
+	struct adsp_out *o = container_of(work, struct adsp_out, hold_work);
+	struct snd_soc_component *c = o->component;
+	struct snd_soc_pcm_runtime *rtd;
+	struct snd_soc_dai *dai;
+	bool hold = READ_ONCE(o->hold);
+	int i;
+
+	if (!c || !c->card)
+		return;
+	for_each_card_rtds(c->card, rtd) {
+		if (snd_soc_rtd_to_cpu(rtd, 0)->component != c)
+			continue;
+		snd_soc_dpcm_mutex_lock(rtd);
+		for_each_rtd_codec_dais(rtd, i, dai)
+			if (!snd_soc_dai_stream_active(dai, SNDRV_PCM_STREAM_PLAYBACK))
+				snd_soc_dai_digital_mute(dai, !hold, SNDRV_PCM_STREAM_PLAYBACK);
+		snd_soc_dpcm_mutex_unlock(rtd);
+	}
+}
+
+static int adsp_out_hw_free(struct snd_soc_component *c, struct snd_pcm_substream *ss)
+{
+	struct adsp_out *o = to_out(c);
+
+	if (READ_ONCE(o->hold))
+		schedule_work(&o->hold_work);
+	return 0;
+}
+
+static const struct snd_kcontrol_new adsp_hdmi_target_control;
+
 static int adsp_out_component_probe(struct snd_soc_component *c)
 {
 	struct adsp_out *o = to_out(c);
 
-	return o->se ? adsp_se_add_controls(c, o->se) : 0;
+	o->component = c;
+	int ret = o->se ? adsp_se_add_controls(c, o->se) : 0;
+
+	if (!ret && o->se)
+		ret = snd_ctl_add(c->card->snd_card,
+				  snd_ctl_new1(&adsp_hdmi_target_control, o->adsp));
+	return ret;
 }
 
 static const struct snd_soc_component_driver adsp_out_component = {
@@ -303,6 +360,7 @@ static const struct snd_soc_component_driver adsp_out_component = {
 	.trigger = adsp_out_trigger,
 	.pointer = adsp_out_pointer,
 	.sync_stop = adsp_out_sync_stop,
+	.hw_free = adsp_out_hw_free,
 	.pcm_construct = adsp_out_construct,
 };
 
@@ -394,14 +452,49 @@ static int adsp_out_init_se(struct adsp_out *o, u32 reader)
 	return adsp_se_start(o->se);
 }
 
+/*
+ * An output that can take the HDMI input: its host glue into a new-style mixer,
+ * whose input 1 takes the HDMI branch's end while the input plays on this output.
+ *   glue (host) --------------------> mixer in 0 -> output
+ *   (HDMI glue -> gain) -- when playing --> mixer in 1
+ * The mixer waits for every input that has delivered data: once the HDMI branch
+ * stops, input 1 must be disconnected and the mixer restarted, or the output
+ * underruns (and buzzes). Connected before the host glue gets its buffer: a glue
+ * is the reader only if its output is connected by then.
+ */
+static int adsp_out_build_hdmi(struct adsp_out *o)
+{
+	struct lg1314_adsp *adsp = o->adsp;
+	int ret;
+
+	ret = adsp_module_create(adsp, OUT_DSP, "mixer", &o->mixer);
+	if (!ret)
+		ret = adsp_module_connect(adsp, o->glue, 0, o->mixer, 0);
+	if (!ret)
+		ret = adsp_module_connect(adsp, o->mixer, 0, o->mod, 0);
+	return ret;
+}
+
+/* The HDMI branch's end into / out of the output's mixer. */
+static int adsp_out_hdmi_attach(struct adsp_out *o, u32 hdmi_out)
+{
+	return adsp_module_connect(o->adsp, hdmi_out, 0, o->mixer, 1);
+}
+
+static void adsp_out_hdmi_detach(struct adsp_out *o, u32 hdmi_out)
+{
+	adsp_module_disconnect(o->adsp, hdmi_out, 0, o->mixer, 1);
+	adsp_module_cmd(o->adsp, o->mixer, ADSP_MOD_STOP, NULL, 0, NULL, 0);
+	adsp_module_cmd(o->adsp, o->mixer, ADSP_MOD_START, NULL, 0, NULL, 0);
+}
+
 /* Build an output's chain, prime it with silence and start it. */
 static int adsp_out_init(struct lg1314_adsp *adsp, struct adsp_out *o, int index)
 {
 	const struct adsp_out_desc *desc = &adsp_outs[index];
 	struct device *dev = adsp->dev;
+	u32 reader, hdmi_out;
 	int ret;
-
-	u32 reader;
 
 	o->adsp = adsp;
 	o->desc = desc;
@@ -409,6 +502,7 @@ static int adsp_out_init(struct lg1314_adsp *adsp, struct adsp_out *o, int index
 	o->slots = desc->slots;
 	spin_lock_init(&o->lock);
 	INIT_WORK(&o->fill_work, adsp_out_fill);
+	INIT_WORK(&o->hold_work, adsp_out_hold_work);
 
 	if (index == OUT_SPEAKER && speaker_se) {
 		ret = adsp_se_build(adsp, &o->se, &reader);
@@ -426,7 +520,11 @@ static int adsp_out_init(struct lg1314_adsp *adsp, struct adsp_out *o, int index
 	ret = adsp_module_create(adsp, OUT_DSP, "glue", &o->glue);
 	if (!ret)
 		ret = adsp_module_create(adsp, OUT_DSP, desc->module, &o->mod);
-	if (!ret)
+	hdmi_out = desc->hdmi ? adsp_se_hdmi_out(adsp->pcm->out[OUT_SPEAKER].se) : 0;
+	if (!ret && hdmi_out) {
+		adsp->pcm->hdmi_out = hdmi_out;
+		ret = adsp_out_build_hdmi(o);
+	} else if (!ret)
 		ret = adsp_module_connect(adsp, o->glue, 0, o->mod, 0);
 	if (ret)
 		return ret;
@@ -439,6 +537,11 @@ static int adsp_out_init(struct lg1314_adsp *adsp, struct adsp_out *o, int index
 	o->sb->on_read = adsp_out_on_read;
 	if (desc->setup) {
 		ret = desc->setup(o);
+		if (ret)
+			return ret;
+	}
+	if (o->mixer) {
+		ret = adsp_module_cmd(adsp, o->mixer, ADSP_MOD_START, NULL, 0, NULL, 0);
 		if (ret)
 			return ret;
 	}
@@ -487,10 +590,119 @@ static void adsp_out_exit(struct adsp_out *o)
 	o->sb->on_read = NULL;
 	mutex_unlock(&adsp->shbuf_lock);
 	cancel_work_sync(&o->fill_work);
+	cancel_work_sync(&o->hold_work);
+	o->component = NULL;
 	if (o->desc->teardown)
 		o->desc->teardown(o);
 	adsp_se_free(o->se);
 	o->se = NULL;
+}
+
+/* Play the HDMI input (port, -1: none) on the selected output. hdmi_lock held. */
+static int adsp_pcm_hdmi_route(struct lg1314_adsp *adsp)
+{
+	struct adsp_pcm *pcm = adsp->pcm;
+	int i, port = pcm->hdmi_port, on = port >= 0 ? pcm->hdmi_target : -1, ret;
+	struct adsp_out *t = on >= 0 ? &pcm->out[on] : NULL;
+
+	/* the output it leaves: its mixer must not wait for the branch's end */
+	if (pcm->hdmi_on > OUT_SPEAKER && pcm->hdmi_on != on)
+		adsp_out_hdmi_detach(&pcm->out[pcm->hdmi_on], pcm->hdmi_out);
+	ret = on > OUT_SPEAKER && pcm->hdmi_on != on ?
+	      adsp_out_hdmi_attach(t, pcm->hdmi_out) : 0;
+	if (!ret)
+		ret = adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, port, on > OUT_SPEAKER);
+	if (ret && on > OUT_SPEAKER)
+		adsp_out_hdmi_detach(t, pcm->hdmi_out);
+	if (ret) {
+		adsp_se_hdmi(pcm->out[OUT_SPEAKER].se, -1, 0);
+		port = -1;
+		on = -1;
+		t = NULL;
+	}
+	pcm->hdmi_on = on;
+	/* the playing output's codecs stay unmuted without a stream */
+	for (i = 0; i < OUT_NUM; i++) {
+		struct adsp_out *o = &pcm->out[i];
+		bool hold = o == t;
+
+		if (READ_ONCE(o->hold) != hold) {
+			WRITE_ONCE(o->hold, hold);
+			schedule_work(&o->hold_work);
+		}
+	}
+	return ret;
+}
+
+/* HDMI receiver port @port (-1: none) plays, on the output the control selects. */
+int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port)
+{
+	struct adsp_pcm *pcm = adsp->pcm;
+	int ret;
+
+	if (!pcm)
+		return -ENODEV;
+	mutex_lock(&pcm->hdmi_lock);
+	pcm->hdmi_port = port;
+	ret = adsp_pcm_hdmi_route(adsp);
+	mutex_unlock(&pcm->hdmi_lock);
+	return ret;
+}
+
+/* "HDMI Input Output": where the HDMI input's audio plays (players set it). */
+static const char * const adsp_hdmi_targets[OUT_NUM] = {
+	[OUT_SPEAKER] = "Speakers", [OUT_SPDIF] = "Optical", [OUT_HP] = "Headphones",
+};
+
+static int adsp_hdmi_target_info(struct snd_kcontrol *kc, struct snd_ctl_elem_info *ui)
+{
+	return snd_ctl_enum_info(ui, 1, OUT_NUM, adsp_hdmi_targets);
+}
+
+static int adsp_hdmi_target_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct lg1314_adsp *adsp = snd_kcontrol_chip(kc);
+
+	uv->value.enumerated.item[0] = READ_ONCE(adsp->pcm->hdmi_target);
+	return 0;
+}
+
+static int adsp_hdmi_target_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uv)
+{
+	struct lg1314_adsp *adsp = snd_kcontrol_chip(kc);
+	struct adsp_pcm *pcm = adsp->pcm;
+	unsigned int t = uv->value.enumerated.item[0];
+	int ret = 0;
+
+	if (t >= OUT_NUM)
+		return -EINVAL;
+	if (t != OUT_SPEAKER && !pcm->out[t].mixer)
+		return -ENODEV;
+	mutex_lock(&pcm->hdmi_lock);
+	if (t != pcm->hdmi_target) {
+		pcm->hdmi_target = t;
+		ret = adsp_pcm_hdmi_route(adsp);
+		ret = ret ? ret : 1;
+	}
+	mutex_unlock(&pcm->hdmi_lock);
+	return ret;
+}
+
+static const struct snd_kcontrol_new adsp_hdmi_target_control = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "HDMI Input Output",
+	.info = adsp_hdmi_target_info,
+	.get = adsp_hdmi_target_get,
+	.put = adsp_hdmi_target_put,
+};
+
+/* Connect the HDMI branches (built with the speaker chain) once the outputs are. */
+static void adsp_pcm_attach_hdmi(struct lg1314_adsp *adsp)
+{
+	int ret = adsp_se_hdmi_attach(adsp->pcm->out[OUT_SPEAKER].se);
+
+	if (ret)
+		dev_warn(adsp->dev, "no HDMI input audio: %d\n", ret);
 }
 
 /*
@@ -506,6 +718,10 @@ int adsp_pcm_init(struct lg1314_adsp *adsp)
 	pcm = devm_kzalloc(dev, sizeof(*pcm), GFP_KERNEL);
 	if (!pcm)
 		return -ENOMEM;
+	mutex_init(&pcm->hdmi_lock);
+	pcm->hdmi_port = -1;
+	pcm->hdmi_on = -1;
+	pcm->hdmi_target = OUT_SPEAKER;
 	pcm->wq = alloc_ordered_workqueue("adsp-pcm", WQ_HIGHPRI);
 	if (!pcm->wq)
 		return -ENOMEM;
@@ -520,6 +736,7 @@ int adsp_pcm_init(struct lg1314_adsp *adsp)
 			goto err;
 		}
 	}
+	adsp_pcm_attach_hdmi(adsp);
 	return 0;
 
 err:

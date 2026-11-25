@@ -91,6 +91,59 @@ static int video_de_blank(struct lg1314_drm *lg, bool blank)
 	return lg1314_de_cmd(lg, DE_CMD_WIN_BLANK, &b, sizeof(b));
 }
 
+int lg1314_video_de_blank(struct lg1314_drm *lg, bool blank)
+{
+	int ret = video_de_blank(lg, blank);
+
+	if (!ret)
+		WRITE_ONCE(lg->video.blanked, blank);
+	return ret;
+}
+
+/*
+ * For other sources of window 0 (lg1314_input.c): point it at source @type
+ * (>= 0; @port is the source's port) and/or set its geometry (@in, @out). The
+ * video plane sets its own source and geometry again when it next shows.
+ */
+int lg1314_video_de_source(struct lg1314_drm *lg, int type, u32 port,
+			   const struct lg1314_de_rect *in, const struct lg1314_de_rect *out)
+{
+	int ret = 0;
+
+	lg1314_video_de_release(lg);
+	if (type >= 0) {
+		struct de_port_src src = { VIDEO_DE_CH, type, 0, port };
+
+		/* Sent twice, as the vendor driver does. */
+		ret = lg1314_de_cmd(lg, DE_CMD_WIN_PORT_SRC, &src, sizeof(src));
+		if (!ret)
+			ret = lg1314_de_cmd(lg, DE_CMD_WIN_PORT_SRC, &src, sizeof(src));
+	}
+	if (!ret && in && out) {
+		struct de_source_size ss = { VIDEO_DE_CH, *in, *in };
+		struct de_win_dim iw = { VIDEO_DE_CH, *in };
+		struct de_win_dim ow = { VIDEO_DE_CH, *out };
+		struct de_win_info wi = { VIDEO_DE_CH, 0, *in, *in, *out };
+
+		ret = lg1314_de_cmd(lg, DE_CMD_SOURCE_SIZE, &ss, sizeof(ss));
+		if (!ret)
+			ret = lg1314_de_cmd(lg, DE_CMD_INPUT_WIN, &iw, sizeof(iw));
+		if (!ret)
+			ret = lg1314_de_cmd(lg, DE_CMD_OUT_WIN, &ow, sizeof(ow));
+		if (!ret)
+			ret = lg1314_de_cmd(lg, DE_CMD_WIN_INFO, &wi, sizeof(wi));
+	}
+	return ret;
+}
+
+/* The window was used for something else: the video plane sets it up again. */
+void lg1314_video_de_release(struct lg1314_drm *lg)
+{
+	lg->video.src_set = false;
+	memset(&lg->video.in, 0, sizeof(lg->video.in));
+	memset(&lg->video.out, 0, sizeof(lg->video.out));
+}
+
 /* Point the window at the decoder output and size it: @in is the visible
  * picture, @out its place on the panel. */
 static int video_de_window(struct lg1314_drm *lg, struct lg1314_video *v,
@@ -379,6 +432,9 @@ static int video_atomic_check(struct drm_plane *plane,
 		return 0;
 
 	cs = drm_atomic_get_new_crtc_state(state, ps->crtc);
+	/* window 0 shows an HDMI input */
+	if (cs && to_lg1314_crtc_state(cs)->video_input)
+		return -EBUSY;
 	ret = drm_atomic_helper_check_plane_state(ps, cs, 1, INT_MAX, true, true);
 	if (ret || !ps->visible)
 		return ret;

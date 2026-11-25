@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <dt-bindings/clock/lge,lg1314-clk.h>
+#include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/thermal/thermal.h>
 
@@ -406,6 +407,31 @@
 		 * interrupt numbers taken from the stock mali_kbase io_resources
 		 * table; the three interrupts are job/mmu/gpu (SPI 94/95/93).
 		 */
+		hdmirx: hdmirx@c9210000 {
+			compatible = "lge,lg1314-hdmirx";
+			reg = <0xc9210000 0x2000>, <0xc9216000 0x2000>,
+			      <0xc9218000 0x2000>, <0xc921e000 0x2000>,
+			      <0xc9220000 0x2000>, <0xc9226000 0x2000>,
+			      <0xc9228000 0x2000>, <0xc922e000 0x2000>,
+			      <0xc36c1000 0x100>,
+			      <0xc9302018 0x4>, <0xc930209c 0x4>;
+			reg-names = "top0", "ctrl0", "top1", "ctrl1",
+				    "top2", "ctrl2", "top3", "ctrl3",
+				    "aled", "ddc", "gate";
+			interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 77 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 80 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 81 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 83 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 84 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "top0", "link0", "top1", "link1",
+					  "top2", "link2", "top3", "link3";
+			isolation-gpios = <&gpio17 4 GPIO_ACTIVE_HIGH>;
+			lge,phy-i2c-bus = <&i2c9>;
+		};
+
 		gpu: gpu@c9200000 {
 			compatible = "arm,mali-t820", "arm,mali-midgard";
 			reg = <0xc9200000 0x4000>;
@@ -824,7 +850,7 @@
 			#size-cells = <0>;
 		};
 
-		i2c@f9000000 {
+		i2c4: i2c@f9000000 {
 			compatible = "lge,lg1k-i2c";
 			reg = <0xf9000000 0x1000>;
 			interrupts = <GIC_SPI 30 IRQ_TYPE_LEVEL_HIGH>;
@@ -879,7 +905,7 @@
 			#size-cells = <0>;
 		};
 
-		i2c@f9500000 {
+		i2c9: i2c@f9500000 {
 			compatible = "lge,lg1k-i2c";
 			reg = <0xf9500000 0x1000>;
 			interrupts = <GIC_SPI 35 IRQ_TYPE_LEVEL_HIGH>;

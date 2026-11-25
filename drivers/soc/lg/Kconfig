@@ -37,11 +37,13 @@ config LG1314_ADSP
 	depends on ARCH_LG1K || COMPILE_TEST
 	depends on OF && HAS_IOMEM
 	depends on SND_SOC
+	depends on VIDEO_LG1314_HDMIRX
 	select GENERIC_ALLOCATOR
 	help
 	  Driver for the two Xtensa audio DSPs on the LG1314 TV SoC: loads
 	  LG's audio firmware into a reserved DRAM area, boots both DSPs and
 	  talks to them over LG's IPC/IMC message rings. Provides the
-	  speaker output as an ASoC CPU DAI.
+	  speaker output as an ASoC CPU DAI, and plays the audio of the HDMI
+	  input being shown.
 
 endmenu

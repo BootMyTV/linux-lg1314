@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "LG media platform drivers"
+
+config VIDEO_LG1314_HDMIRX
+	tristate "LG1314 HDMI receiver"
+	depends on V4L_PLATFORM_DRIVERS
+	depends on VIDEO_DEV && I2C
+	depends on VIDEO_LG_HAWK2
+	depends on ARCH_LG1K || COMPILE_TEST
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	help
+	  The HDMI inputs of the LG1314 (M19) TV SoC: four Synopsys
+	  DesignWare HDMI RX 2.0 controllers with LG PHYs, as V4L2
+	  subdevices (EDID, hotplug, link lock, DV timings).
+
+config VIDEO_LG_HAWK2
+	tristate "LG HAWK2 HDMI 2.1 switch"
+	depends on I2C && GPIOLIB && OF
+	depends on ARCH_LG1K || COMPILE_TEST
+	help
+	  The HDMI 2.1 switch in front of the SoC's HDMI receivers on
+	  LG's 2019 OLED TVs. It serves EDID and hotplug to the sources
+	  and forwards the selected one to the SoC.

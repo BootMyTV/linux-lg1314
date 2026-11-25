@@ -209,6 +209,7 @@
 		lge,micom = <&micom>;
 		lge,tcon = <&tcon>;
 		lge,vdec = <&vdec>;
+		lge,hdmirx = <&hdmirx>;
 		/* OSD mixer vsync, DE sync pulses (video tick), DE IPC */
 		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
 			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>,
@@ -239,6 +240,8 @@
 		interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>,
 			     <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
 		memory-region = <&adsp_mem>;
+		/* HDMI input audio follows the input shown */
+		lge,hdmirx = <&hdmirx>;
 
 		/* DSP1's outputs: one DAI each */
 		adsp_speaker: speaker {
@@ -427,6 +430,26 @@
 		#gpio-cells = <2>;
 		gpio-line-names = "HP_MUTE";
 	};
+};
+
+/*
+ * HDMI 2.1 switch in front of the SoC's HDMI receivers (stock "HAWK2", GPIOs 29/30
+ * reset/standby, 93 CMD_READY). Its port n feeds SoC port n; connector HDMI k is
+ * on switch port 4 - k.
+ */
+&i2c4 {
+	hawk2: hdmi-switch@21 {
+		compatible = "lge,hawk2";
+		reg = <0x21>;
+		reset-gpios = <&gpio3 5 GPIO_ACTIVE_HIGH>;
+		standby-gpios = <&gpio3 6 GPIO_ACTIVE_HIGH>;
+		cmd-ready-gpios = <&gpio11 5 GPIO_ACTIVE_HIGH>;
+		lge,user-ports = <4 3 2 1>;
+	};
+};
+
+&hdmirx {
+	lge,hdmi-switch = <&hawk2>;
 };
 
 /* The OLED panel's timing controller (16-bit register addresses). */

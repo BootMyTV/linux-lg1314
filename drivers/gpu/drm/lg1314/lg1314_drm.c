@@ -107,7 +107,7 @@ static unsigned int lg1314_mode_refresh(const struct drm_display_mode *m)
 	return 0;
 }
 
-static unsigned int lg1314_panel_hz(unsigned int refresh_mhz)
+unsigned int lg1314_panel_hz(unsigned int refresh_mhz)
 {
 	return refresh_mhz < 49000 ? 96 : refresh_mhz < 55000 ? 100 : 120;
 }
@@ -123,7 +123,8 @@ static void lg1314_crtc_set_refresh(struct lg1314_drm *lg,
 	drm_dbg_kms(&lg->drm, "refresh %u.%03u Hz, panel %u Hz\n",
 		    r / 1000, r % 1000, lg1314_panel_hz(r));
 	lg->refresh_mhz = r;
-	if (lg->de_fw_loaded)
+	/* while an input shows, the panel is locked to it */
+	if (lg->de_fw_loaded && !lg1314_input_owns_rate(lg))
 		lg1314_de_frame_lock(lg, lg1314_panel_hz(r));
 	lg1314_video_set_tick(lg, r);
 	drm_calc_timestamping_constants(&lg->crtc, m);
@@ -381,6 +382,7 @@ static void lg1314_crtc_atomic_disable(struct drm_crtc *crtc,
 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 
 	drm_crtc_vblank_off(crtc);
+	lg1314_input_set(lg, 0);
 
 	if (lg->enabled) {
 		lg->enabled = false;
@@ -398,6 +400,19 @@ static void lg1314_crtc_atomic_disable(struct drm_crtc *crtc,
 	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
+/* An input leaving window 0 goes before the planes update (the video plane
+ * may take the window in the same commit). */
+static void lg1314_crtc_atomic_begin(struct drm_crtc *crtc,
+				     struct drm_atomic_state *state)
+{
+	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(state, crtc);
+	unsigned int in = cs->active ? to_lg1314_crtc_state(cs)->video_input : 0;
+
+	if (to_lg1314_crtc_state(old)->video_input && !in)
+		lg1314_input_set(to_lg1314(crtc->dev), 0);
+}
+
 /*
  * Complete the flip at the next vblank, unless the video plane took the
  * event: then it completes when the video frame is on screen.
@@ -410,6 +425,8 @@ static void lg1314_crtc_atomic_flush(struct drm_crtc *crtc,
 
 	if (cs->active)
 		lg1314_crtc_set_refresh(to_lg1314(crtc->dev), &cs->adjusted_mode);
+	lg1314_input_set(to_lg1314(crtc->dev),
+			 cs->active ? to_lg1314_crtc_state(cs)->video_input : 0);
 	lg1314_hdr_commit(to_lg1314(crtc->dev), state);
 
 	spin_lock_irq(&crtc->dev->event_lock);
@@ -440,6 +457,22 @@ static int lg1314_crtc_atomic_check(struct drm_crtc *crtc,
 {
 	struct drm_crtc_state *cs = drm_atomic_get_new_crtc_state(state, crtc);
 	struct drm_crtc_state *old = drm_atomic_get_old_crtc_state(state, crtc);
+	struct lg1314_drm *lg = to_lg1314(crtc->dev);
+
+	/* an input takes window 0: not with a picture on the video plane */
+	if (to_lg1314_crtc_state(cs)->video_input) {
+		if (!lg1314_input_rx(lg))
+			return -ENODEV;
+		if (lg->video.vdec_np) {
+			struct drm_plane_state *ps =
+				drm_atomic_get_plane_state(state, &lg->video.plane);
+
+			if (IS_ERR(ps))
+				return PTR_ERR(ps);
+			if (ps->fb && ps->crtc)
+				return -EBUSY;
+		}
+	}
 
 	if (cs->mode_changed && cs->active && old->active &&
 	    !cs->active_changed && !cs->connectors_changed &&
@@ -452,18 +485,65 @@ static int lg1314_crtc_atomic_check(struct drm_crtc *crtc,
 static const struct drm_crtc_helper_funcs lg1314_crtc_helper_funcs = {
 	.mode_valid = lg1314_crtc_mode_valid,
 	.atomic_check = lg1314_crtc_atomic_check,
+	.atomic_begin = lg1314_crtc_atomic_begin,
 	.atomic_enable = lg1314_crtc_atomic_enable,
 	.atomic_disable = lg1314_crtc_atomic_disable,
 	.atomic_flush = lg1314_crtc_atomic_flush,
 };
 
+static void lg1314_crtc_destroy_state(struct drm_crtc *crtc, struct drm_crtc_state *s)
+{
+	__drm_atomic_helper_crtc_destroy_state(s);
+	kfree(to_lg1314_crtc_state(s));
+}
+
+static void lg1314_crtc_reset(struct drm_crtc *crtc)
+{
+	struct lg1314_crtc_state *s = kzalloc(sizeof(*s), GFP_KERNEL);
+
+	if (crtc->state)
+		lg1314_crtc_destroy_state(crtc, crtc->state);
+	__drm_atomic_helper_crtc_reset(crtc, s ? &s->base : NULL);
+}
+
+static struct drm_crtc_state *lg1314_crtc_duplicate_state(struct drm_crtc *crtc)
+{
+	struct lg1314_crtc_state *s = kzalloc(sizeof(*s), GFP_KERNEL);
+
+	if (!s)
+		return NULL;
+	__drm_atomic_helper_crtc_duplicate_state(crtc, &s->base);
+	s->video_input = to_lg1314_crtc_state(crtc->state)->video_input;
+	return &s->base;
+}
+
+static int lg1314_crtc_set_property(struct drm_crtc *crtc, struct drm_crtc_state *s,
+				    struct drm_property *prop, u64 val)
+{
+	if (prop != to_lg1314(crtc->dev)->input.prop)
+		return -EINVAL;
+	to_lg1314_crtc_state(s)->video_input = val;
+	return 0;
+}
+
+static int lg1314_crtc_get_property(struct drm_crtc *crtc, const struct drm_crtc_state *s,
+				    struct drm_property *prop, u64 *val)
+{
+	if (prop != to_lg1314(crtc->dev)->input.prop)
+		return -EINVAL;
+	*val = container_of(s, struct lg1314_crtc_state, base)->video_input;
+	return 0;
+}
+
 static const struct drm_crtc_funcs lg1314_crtc_funcs = {
-	.reset = drm_atomic_helper_crtc_reset,
+	.reset = lg1314_crtc_reset,
 	.destroy = drm_crtc_cleanup,
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
-	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_crtc_destroy_state,
+	.atomic_duplicate_state = lg1314_crtc_duplicate_state,
+	.atomic_destroy_state = lg1314_crtc_destroy_state,
+	.atomic_set_property = lg1314_crtc_set_property,
+	.atomic_get_property = lg1314_crtc_get_property,
 	.enable_vblank = lg1314_enable_vblank,
 	.disable_vblank = lg1314_disable_vblank,
 };
@@ -645,6 +725,9 @@ static int lg1314_init_mode_config(struct lg1314_drm *lg)
 		return ret;
 
 	ret = lg1314_video_init(lg);
+	if (ret)
+		return ret;
+	ret = lg1314_input_init(lg);
 	if (ret)
 		return ret;
 
@@ -887,6 +970,7 @@ static int lg1314_probe(struct platform_device *pdev)
 	return 0;
 
 err_video:
+	lg1314_input_fini(lg);
 	lg1314_video_fini(lg);
 err_micom:
 	if (lg->hdr.tcon)
@@ -903,6 +987,7 @@ static void lg1314_remove(struct platform_device *pdev)
 	/* the timing controller while the panel is still powered */
 	lg1314_hdr_fini(lg);
 	drm_atomic_helper_shutdown(&lg->drm);
+	lg1314_input_fini(lg);
 	lg1314_video_fini(lg);
 	if (lg->hdr.tcon)
 		put_device(&lg->hdr.tcon->dev);

@@ -56,6 +56,7 @@
 #define AUD_BUF_REVERSE		0x1130		/* 4 words, "checkbit" init */
 #define AUD_OFF_SCHEDULER	0x1258
 #define AUD_HB(n)		(0x12ac + 4 * (n))	/* heartbeat counters */
+#define AUD_VER_CHIP		0x12e8		/* SoC revision, lx_chip_rev() */
 #define AUD_PTS_LIP0		0x1274
 #define AUD_PTS_LIP1		0x1278
 #define AUD_TPM_BUFSIZE		0x127c
@@ -64,6 +65,13 @@
 #define AUD_VER1(n)		(0x12f0 + 4 * (n))
 #define AUD_VER0(n)		(0x12f8 + 4 * (n))
 #define AUD_BC_TABLE		0x1300		/* 16 x {base, size, amfl, ul} */
+
+/*
+ * The firmware picks chip-specific paths from aud_ver_chip (e.g. the HDMI input
+ * select in HAL_SetHdmiInputPort is skipped below M19). Stock writes
+ * lx_chip_rev(): chip << 8 | revision, M19 = 0x23; the B9 is M19 A1.
+ */
+#define LG1314_CHIP_REV		0x23a1
 
 #define SWRESET_VAL		0x019fc13f	/* AXI, APB, AVER, FS, AAD, HMR, I2S */
 #define SWRESET_AXI		BIT(0)
@@ -156,6 +164,7 @@ static void adsp_init_shared(struct lg1314_adsp *adsp)
 	adsp_wr(adsp, AUD_TPM_BUFSIZE, 0x03a00380);
 	adsp_wr(adsp, AUD_TPA_BUFSIZE, 0x03a00380);
 	adsp_wr(adsp, AUD_OFF_SCHEDULER, 0x00010001);
+	adsp_wr(adsp, AUD_VER_CHIP, LG1314_CHIP_REV);
 
 	for (i = 0; i < ARRAY_SIZE(adsp_bcs); i++) {
 		adsp_wr(adsp, AUD_BC_TABLE + 16 * i + 0, base + adsp_bcs[i].off);
@@ -426,6 +435,19 @@ int adsp_module_connect(struct lg1314_adsp *adsp, u32 out_uid, u32 out_port,
 				ADSP_CONNECTOR_CONNECT, param, sizeof(param), NULL, 0, 1000);
 }
 EXPORT_SYMBOL_GPL(adsp_module_connect);
+
+int adsp_module_disconnect(struct lg1314_adsp *adsp, u32 out_uid, u32 out_port,
+			   u32 in_uid, u32 in_port)
+{
+	u32 param[4] = { out_uid, out_port, in_uid, in_port };
+	int dsp = uid_dsp(out_uid);
+
+	if (dsp < 0 || uid_dsp(in_uid) != dsp)
+		return -EINVAL;
+	return adsp_imc_command(adsp, dsp, ADSP_UID_CONNECTOR(ADSP_UID_PROC(out_uid)),
+				ADSP_CONNECTOR_DISCONNECT, param, sizeof(param), NULL, 0, 1000);
+}
+EXPORT_SYMBOL_GPL(adsp_module_disconnect);
 
 /* New-style modules: "name=value" string properties. */
 int adsp_module_set_prop(struct lg1314_adsp *adsp, u32 uid, const char *prop)
@@ -707,6 +729,8 @@ static int lg1314_adsp_probe(struct platform_device *pdev)
 		ret = adsp_pcm_init(adsp);
 	if (ret)
 		dev_err(dev, "DSP boot or speaker setup failed: %d\n", ret);
+	else
+		adsp_hdmi_init(adsp);
 	/* stay bound either way: status and logs remain available */
 	return 0;
 }
@@ -717,6 +741,7 @@ static void lg1314_adsp_remove(struct platform_device *pdev)
 	struct adsp_impl *impl, *tmp;
 	int n;
 
+	adsp_hdmi_exit(adsp);
 	adsp_pcm_exit(adsp);
 	adsp->running = false;
 	cancel_delayed_work_sync(&adsp->poll_work);

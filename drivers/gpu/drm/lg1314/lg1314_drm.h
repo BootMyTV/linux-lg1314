@@ -19,6 +19,8 @@
 #include <drm/drm_plane.h>
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
+#include <linux/notifier.h>
+#include <media/lg1314-hdmirx.h>
 
 struct drm_framebuffer;
 struct drm_pending_vblank_event;
@@ -415,12 +417,33 @@ struct lg1314_drm {
 		unsigned int		seq;
 	} status;
 
+	/* an HDMI input in the video window (lg1314_input.c) */
+	struct {
+		struct device_node	*np;	/* lge,hdmirx */
+		struct lg1314_hdmirx	*rx;	/* once a commit wanted it */
+		struct drm_property	*prop;	/* CRTC "VIDEO_INPUT" */
+		struct notifier_block	nb;
+		struct work_struct	work;
+		struct mutex		lock;
+		unsigned int		active;	/* connector selected, 0 none */
+		bool			shown;	/* window set up for sig */
+		unsigned int		panel_hz;	/* locked to the input; 0 none */
+		struct lg1314_hdmirx_signal sig;
+	} input;
+
 	/* channel-power register value preserved from lxboot at probe */
 	u32				chpower_save;
 	bool				enabled;
 };
 
 #define to_lg1314(ddev)	container_of(ddev, struct lg1314_drm, drm)
+
+struct lg1314_crtc_state {
+	struct drm_crtc_state	base;
+	unsigned int		video_input;	/* VIDEO_INPUT: 0 off, HDMI 1..4 */
+};
+
+#define to_lg1314_crtc_state(s)	container_of(s, struct lg1314_crtc_state, base)
 
 /* MMIO helpers: resolve an absolute phys addr to the mapped span and access it. */
 void __iomem *lg1314_map(struct lg1314_drm *lg, u32 phys);
@@ -440,6 +463,16 @@ int  lg1314_video_init(struct lg1314_drm *lg);
 void lg1314_video_fini(struct lg1314_drm *lg);
 void lg1314_video_debugfs_init(struct lg1314_drm *lg);
 void lg1314_video_set_tick(struct lg1314_drm *lg, unsigned int tick_mhz);
+int  lg1314_video_de_blank(struct lg1314_drm *lg, bool blank);
+int  lg1314_video_de_source(struct lg1314_drm *lg, int type, u32 port,
+			    const struct lg1314_de_rect *in, const struct lg1314_de_rect *out);
+void lg1314_video_de_release(struct lg1314_drm *lg);
+int  lg1314_input_init(struct lg1314_drm *lg);
+void lg1314_input_fini(struct lg1314_drm *lg);
+void lg1314_input_set(struct lg1314_drm *lg, unsigned int connector);
+bool lg1314_input_owns_rate(struct lg1314_drm *lg);
+struct lg1314_hdmirx *lg1314_input_rx(struct lg1314_drm *lg);
+unsigned int lg1314_panel_hz(unsigned int refresh_mhz);
 int  lg1314_panel_vcc(struct lg1314_drm *lg, bool on);
 int  lg1314_panel_evdd(struct lg1314_drm *lg, bool on);
 void lg1314_osd_init(struct lg1314_drm *lg);

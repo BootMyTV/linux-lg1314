@@ -78,6 +78,7 @@ enum adsp_imc_action {
 #define ADSP_REGISTRY_CREATE	ADSP_CMD(ADSP_CMD_MOD(ADSP_CMD_MANAGER, 0xf0), 36)
 #define ADSP_REGISTRY_DESTROY	ADSP_CMD(ADSP_CMD_MOD(ADSP_CMD_MANAGER, 0xf1), 4)
 #define ADSP_CONNECTOR_CONNECT	ADSP_CMD(0xf100, 16)
+#define ADSP_CONNECTOR_DISCONNECT ADSP_CMD(0xf101, 16)	/* {out uid, port, in uid, port} */
 #define ADSP_CONNECTOR_DISCONNECT ADSP_CMD(0xf101, 16)
 
 /* Generic module commands */
@@ -205,6 +206,7 @@ struct lg1314_adsp {
 	u32 shbuf_next;
 
 	struct adsp_pcm *pcm;		/* PCM outputs (lg1314-adsp-pcm.c) */
+	struct adsp_hdmi *hdmi;		/* HDMI input audio (lg1314-adsp-hdmi.c) */
 
 	struct dentry *debugfs;
 	struct adsp_shbuf *dbg_sb;
@@ -241,6 +243,8 @@ int adsp_module_create(struct lg1314_adsp *adsp, int dsp, const char *impl, u32 
 int adsp_module_destroy(struct lg1314_adsp *adsp, u32 uid);
 int adsp_module_connect(struct lg1314_adsp *adsp, u32 out_uid, u32 out_port,
 			u32 in_uid, u32 in_port);
+int adsp_module_disconnect(struct lg1314_adsp *adsp, u32 out_uid, u32 out_port,
+			   u32 in_uid, u32 in_port);
 int adsp_module_cmd(struct lg1314_adsp *adsp, u32 uid, u32 cmd, const void *param,
 		    u32 len, void *rsp, u32 rsp_len);
 int adsp_module_set_prop(struct lg1314_adsp *adsp, u32 uid, const char *prop);
@@ -266,10 +270,18 @@ int adsp_se_attach(struct adsp_se *se, struct adsp_shbuf *sb);
 int adsp_se_start(struct adsp_se *se);
 void adsp_se_free(struct adsp_se *se);
 int adsp_se_add_controls(struct snd_soc_component *c, struct adsp_se *se);
+int adsp_se_hdmi(struct adsp_se *se, int port, int branch);
+u32 adsp_se_hdmi_out(struct adsp_se *se);
+int adsp_se_hdmi_attach(struct adsp_se *se);
 
 /* lg1314-adsp-pcm.c */
 int adsp_pcm_init(struct lg1314_adsp *adsp);
 void adsp_pcm_exit(struct lg1314_adsp *adsp);
+int adsp_pcm_hdmi(struct lg1314_adsp *adsp, int port);
+
+/* lg1314-adsp-hdmi.c */
+void adsp_hdmi_init(struct lg1314_adsp *adsp);
+void adsp_hdmi_exit(struct lg1314_adsp *adsp);
 struct platform_driver;
 extern struct platform_driver adsp_out_driver;
 
