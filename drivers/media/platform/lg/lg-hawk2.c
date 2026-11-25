@@ -169,7 +169,7 @@ static void hawk2_select_source(struct lg_hawk2 *hw, int port)
 	}
 	dev_info(&hw->client->dev, "source: port %d (HDMI %u)\n", port, hw->user_port[port]);
 	hw->prev_source = port;
-	hw->source = port;
+	WRITE_ONCE(hw->source, port);
 }
 
 static void hawk2_update_5v(struct lg_hawk2 *hw, int port)
@@ -257,7 +257,7 @@ static void hawk2_setup(struct lg_hawk2 *hw)
 	}
 	hawk2_select_edid(hw);
 	if (hw->wanted >= 0)
-		hw->source = hw->wanted;
+		WRITE_ONCE(hw->source, hw->wanted);
 	if (hw->source >= 0)
 		hawk2_select_source(hw, hw->source);
 	for (p = 0; p < HAWK2_PORTS; p++) {
@@ -434,6 +434,13 @@ int lg_hawk2_connector_port(struct lg_hawk2 *hw, unsigned int connector)
 	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(lg_hawk2_connector_port);
+
+/* The receiver port the switch currently routes its source to, -1 for none. */
+int lg_hawk2_source(struct lg_hawk2 *hw)
+{
+	return READ_ONCE(hw->source);
+}
+EXPORT_SYMBOL_GPL(lg_hawk2_source);
 
 unsigned int lg_hawk2_split(struct lg_hawk2 *hw, int port)
 {

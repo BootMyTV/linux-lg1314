@@ -657,12 +657,40 @@ static unsigned int hdmirx_audio_rate(u32 n, u32 cts, unsigned int khz)
  * keep the fill centred), and the output muted until the stream has been clean
  * for AUD_STABLE polls.
  */
+/*
+ * A secondary quarter of the switch's actively-routed split carries video only -
+ * the audio rides on the first part (connector_port[0]) - so its audio FIFO never
+ * fills and the poll below would flap and spam "audio FIFO error". Gate on the
+ * routed source, not a bare split report: an unselected FRL input is measured as
+ * split but occupies no receiver ports, and its ports may hold other live inputs.
+ */
+static bool hdmirx_audio_dead_part(struct lg1314_hdmirx *rx, unsigned int port)
+{
+	int src, n, i;
+
+	if (!rx->sw)
+		return false;
+	src = lg_hawk2_source(rx->sw);
+	if (src < 0)
+		return false;
+	n = lg_hawk2_split(rx->sw, src);
+	for (i = 1; i < n && i < LG1314_HDMIRX_CONNECTORS; i++)
+		if (rx->connector_port[i] == (int)port)
+			return true;
+	return false;
+}
+
 static void hdmirx_audio_poll(struct hdmirx_port *p)
 {
 	struct lg1314_hdmirx_audio aud = { };
 	u32 n = 0, cts = 0, sts, ists, fill, st;
 	unsigned int khz = 0;
 
+	if (hdmirx_audio_dead_part(p->rx, p->id)) {
+		if (!p->aud_muted)
+			hdmirx_audio_mute(p, true);
+		return;
+	}
 	if (p->locked) {
 		n = FIELD_GET(ACR_VAL, ctrl_rd(p, RA_PDEC_ACR_N));
 		cts = FIELD_GET(ACR_VAL, ctrl_rd(p, RA_PDEC_ACR_CTS));

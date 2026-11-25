@@ -23,6 +23,7 @@ void lg_hawk2_select(struct lg_hawk2 *hw, int port);
  * @port over (1, 2 or 4: left to right over the ports of connectors HDMI 1, 2, ...),
  * for signals beyond one HDMI 2.0 receiver (4K100/120 over FRL).
  */
+int lg_hawk2_source(struct lg_hawk2 *hw);
 unsigned int lg_hawk2_split(struct lg_hawk2 *hw, int port);
 /*
  * The active width of the picture the switch receives on @port (0: none). Its split
