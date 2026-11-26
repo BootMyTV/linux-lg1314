@@ -210,6 +210,9 @@
 		lge,tcon = <&tcon>;
 		lge,vdec = <&vdec>;
 		lge,hdmirx = <&hdmirx>;
+		/* Factory white balance: cool, normal, warm */
+		nvmem-cells = <&factory_wb>;
+		nvmem-cell-names = "white-balance";
 		/* OSD mixer vsync, DE sync pulses (video tick), DE IPC */
 		interrupts = <GIC_SPI 72 IRQ_TYPE_LEVEL_HIGH>,
 			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>,
@@ -438,6 +441,37 @@
  * on switch port 4 - k.
  */
 &i2c4 {
+	/*
+	 * The board NVM (stock webOS's "EEPROM NVM": its settings, factory data
+	 * and calibration). Read-only here: stock owns the contents.
+	 */
+	eeprom@50 {
+		compatible = "atmel,24c64";
+		reg = <0x50>;
+		read-only;
+
+		nvmem-layout {
+			compatible = "fixed-layout";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/*
+			 * Factory white balance, three points (cool, normal, warm):
+			 * R, G, B gain (0xc0 = 1.0), R, G, B offset (0x40 = 0)
+			 */
+			factory_wb: white-balance@582 {
+				reg = <0x582 18>;
+			};
+
+			/* The Ethernet MAC address, as text "XX:XX:XX:XX:XX:XX" */
+			eth_mac: mac-address@1bac {
+				compatible = "mac-base";
+				reg = <0x1bac 17>;
+				#nvmem-cell-cells = <1>;
+			};
+		};
+	};
+
 	hawk2: hdmi-switch@21 {
 		compatible = "lge,hawk2";
 		reg = <0x21>;
@@ -450,6 +484,11 @@
 
 &hdmirx {
 	lge,hdmi-switch = <&hawk2>;
+};
+
+&eth0 {
+	nvmem-cells = <&eth_mac 0>;
+	nvmem-cell-names = "mac-address";
 };
 
 /* The OLED panel's timing controller (16-bit register addresses). */

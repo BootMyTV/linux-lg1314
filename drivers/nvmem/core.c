@@ -7,6 +7,7 @@
  */
 
 #include <linux/device.h>
+#include <linux/etherdevice.h>
 #include <linux/export.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
@@ -786,6 +787,33 @@ static int nvmem_validate_keepouts(struct nvmem_device *nvmem)
 	return 0;
 }
 
+/*
+ * A "mac-base" cell (nvmem/layouts/fixed-cell.yaml): a base MAC address stored
+ * as 6 raw bytes or as text "00:11:22:33:44:55"; the consumer's cell argument
+ * is added to it.
+ */
+static int nvmem_mac_base_read_post_process(void *context, const char *id,
+					    int index, unsigned int offset,
+					    void *buf, size_t bytes)
+{
+	u8 mac[ETH_ALEN];
+
+	if (bytes == 3 * ETH_ALEN - 1) {
+		if (!mac_pton(buf, mac))
+			return -EINVAL;
+	} else if (bytes == ETH_ALEN) {
+		ether_addr_copy(mac, buf);
+	} else {
+		return -EINVAL;
+	}
+
+	if (index)
+		eth_addr_add(mac, index);
+	ether_addr_copy(buf, mac);
+
+	return 0;
+}
+
 int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
 {
 	struct device *dev = &nvmem->dev;
@@ -823,6 +851,19 @@ int nvmem_add_cells_from_dt(struct nvmem_device *nvmem, struct device_node *np)
 		}
 
 		info.np = of_node_get(child);
+
+		if (of_device_is_compatible(child, "mac-base")) {
+			if (info.bytes != ETH_ALEN && info.bytes != 3 * ETH_ALEN - 1) {
+				dev_err(dev, "nvmem: invalid mac-base size on %pOF\n", child);
+				of_node_put(child);
+				of_node_put(info.np);
+				kfree(info.name);
+				return -EINVAL;
+			}
+			info.raw_len = info.bytes;
+			info.bytes = ETH_ALEN;
+			info.read_post_process = nvmem_mac_base_read_post_process;
+		}
 
 		if (nvmem->fixup_dt_cell_info)
 			nvmem->fixup_dt_cell_info(nvmem, &info);

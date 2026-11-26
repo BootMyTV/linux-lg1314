@@ -43,6 +43,9 @@ struct lg1314_dovi_status {
 	u32		tgt_min, tgt_max;	/* the target */
 };
 
+#define LG1314_DPG_PTS		1024
+#define LG1314_DPG_MAX		32767
+
 /* MMIO regions (the bring-up tables use absolute phys addresses). */
 enum lg1314_region {
 	LG1314_REG_OSD,		/* 0xc9010000 : OSD top/ctrl/afbc/shp         */
@@ -327,6 +330,14 @@ struct lg1314_drm {
 	unsigned int			vsync_count;
 	int				osd_sharpen;	/* applied: 0, 1; -1 unknown */
 	u32				osd_vsp[2];	/* applied OSD_VSP_BOSD_CTRL_0/1 */
+	/* output gamma LUT (lg1314_dpg.c), under its dpg_lock */
+	struct {
+		int		state;		/* 0 off, 1 on with lut; -1 unknown */
+		u16		lut[3][LG1314_DPG_PTS];	/* R, G, B as written */
+		u16		next[3][LG1314_DPG_PTS];	/* scratch */
+		u32		factory[3][3];	/* cool, normal, warm × R, G, B (ppm) */
+		bool		factory_valid;
+	} dpg;
 	bool				video_phase;	/* vblank at video ticks */
 	/* video tick timing, for calibrating the output's rate */
 	unsigned int			tick_n;
@@ -511,6 +522,13 @@ void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_osd_sharpen_update(struct lg1314_drm *lg);
 void lg1314_osd_detach(struct lg1314_drm *lg);
+
+/* Output gamma LUT (DPE DPG): 3 × 1024 entries, 15 bit. */
+int lg1314_dpg_init(struct lg1314_drm *lg);
+void lg1314_dpg_attach(struct lg1314_drm *lg);
+void lg1314_dpg_detach(struct lg1314_drm *lg);
+void lg1314_dpg_debugfs_init(struct lg1314_drm *lg);
+void lg1314_dpg_curve(u16 *lut, unsigned int gamma_x100);	/* FPU */
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 struct drm_atomic_state;
 int  lg1314_hdr_setup(struct lg1314_drm *lg);

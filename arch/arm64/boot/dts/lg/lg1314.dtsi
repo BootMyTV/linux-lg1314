@@ -375,10 +375,6 @@
 			clocks = <&busclk>, <&busclk>;
 			clock-names = "hclk", "pclk";
 			phy-mode = "rmii";
-			/* Placeholder populated by the boot firmware at runtime.
-			 * TODO: resolve the MAC from the board's I2C EEPROM via
-			 * nvmem-cells instead of a boot-firmware-patched placeholder. */
-			mac-address = [00 00 00 00 00 00];
 			#address-cells = <1>;
 			#size-cells = <0>;
 

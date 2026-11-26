@@ -342,6 +342,7 @@ static void lg1314_crtc_atomic_enable(struct drm_crtc *crtc,
 	ret = lg1314_ovi_enable(lg);
 	if (ret)
 		goto err_vcc;
+	lg1314_dpg_attach(lg);
 
 	/*
 	 * The DE firmware is downloaded once and keeps running across display
@@ -882,6 +883,10 @@ static int lg1314_probe(struct platform_device *pdev)
 	lg->dev = dev;
 	platform_set_drvdata(pdev, lg);
 
+	ret = lg1314_dpg_init(lg);	/* may defer for the EEPROM: do it first */
+	if (ret)
+		return ret;
+
 	ret = drmm_mutex_init(&lg->drm, &lg->de_lock);
 	if (ret)
 		return ret;
@@ -969,6 +974,7 @@ static int lg1314_probe(struct platform_device *pdev)
 		goto err_video;
 	lg1314_de_debugfs_init(lg);
 	lg1314_video_debugfs_init(lg);
+	lg1314_dpg_debugfs_init(lg);
 
 	drm_client_setup(&lg->drm, NULL);
 	return 0;
@@ -988,6 +994,7 @@ static void lg1314_remove(struct platform_device *pdev)
 	struct lg1314_drm *lg = platform_get_drvdata(pdev);
 
 	lg1314_osd_detach(lg);
+	lg1314_dpg_detach(lg);
 	drm_dev_unplug(&lg->drm);
 	/* the timing controller while the panel is still powered */
 	lg1314_hdr_fini(lg);
