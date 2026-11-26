@@ -987,6 +987,7 @@ static void lg1314_remove(struct platform_device *pdev)
 {
 	struct lg1314_drm *lg = platform_get_drvdata(pdev);
 
+	lg1314_osd_detach(lg);
 	drm_dev_unplug(&lg->drm);
 	/* the timing controller while the panel is still powered */
 	lg1314_hdr_fini(lg);

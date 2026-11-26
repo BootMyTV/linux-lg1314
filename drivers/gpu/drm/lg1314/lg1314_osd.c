@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* LG1314 OSD0 graphics plane: HW init, scanout header, enable. */
 
+#include <linux/bitfield.h>
 #include <linux/moduleparam.h>
 #include <linux/sizes.h>
 
@@ -41,6 +42,118 @@ void lg1314_osd_sharpen_update(struct lg1314_drm *lg)
 }
 
 /*
+ * The graphics plane's YC adjust (OSD_VSP_BOSD_*): luma scaled about black
+ * (0x10) and offset, chroma scaled. Changes apply at once (vblank may be off
+ * while nothing flips); the OSD block is never gated, and lg1314_osd_init()
+ * applies them again on every display enable. All neutral: the adjust is off.
+ *
+ * osd_white: white level, percent (100: as drawn). Chroma scales with it, so
+ *   the GUI dims without a colour shift or lifted blacks.
+ * osd_saturation: chroma, percent on top of that (100: unchanged). Default
+ *   90: the GUI is sRGB on a ~P3 panel, unconverted; a chroma scale can't
+ *   rotate hues, but 85-90 minimises the error (model, unmeasured).
+ * osd_black: luma offset in the hardware's steps (0: none; scale unmeasured),
+ *   like a TV's brightness control: lifts (or crushes) black, and shifts
+ *   everything above it by the same amount.
+ */
+static unsigned int osd_white = 50;
+static unsigned int osd_saturation = 90;
+static int osd_black;
+static DEFINE_SPINLOCK(osd_adjust_lock);
+static struct lg1314_drm *osd_adjust_dev;	/* under osd_adjust_lock */
+
+/* The adjust as the params say, if not so already. osd_adjust_lock held. */
+static void osd_adjust_apply(struct lg1314_drm *lg)
+{
+	u32 white = min(READ_ONCE(osd_white), 100U);
+	u32 sat = min(READ_ONCE(osd_saturation), 199U);
+	int black = clamp(READ_ONCE(osd_black), -512, 511);
+	u32 ctrl0 = 0, ctrl1 = 0;
+
+	if (white != 100 || sat != 100 || black) {
+		ctrl0 = OSD_VSP_EN |
+			FIELD_PREP(OSD_VSP_CENTER, 0x10) |
+			FIELD_PREP(OSD_VSP_CONTRAST, 0x200 * white / 100);
+		ctrl1 = FIELD_PREP(OSD_VSP_SATURATION,
+				   min(0x80 * white * sat / 10000, 0xffU)) |
+			FIELD_PREP(OSD_VSP_OFFSET, 0x200 + black);
+	}
+	if (ctrl0 == lg->osd_vsp[0] && ctrl1 == lg->osd_vsp[1])
+		return;
+	lg1314_wr(lg, OSD_BANK_PHYS + OSD_VSP_BOSD_CTRL_1, ctrl1);
+	lg1314_wr(lg, OSD_BANK_PHYS + OSD_VSP_BOSD_CTRL_0, ctrl0);
+	lg->osd_vsp[0] = ctrl0;
+	lg->osd_vsp[1] = ctrl1;
+}
+
+static void osd_adjust_update(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&osd_adjust_lock, flags);
+	if (osd_adjust_dev)
+		osd_adjust_apply(osd_adjust_dev);
+	spin_unlock_irqrestore(&osd_adjust_lock, flags);
+}
+
+static int osd_adjust_set_uint(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (!ret)
+		osd_adjust_update();
+	return ret;
+}
+
+static int osd_adjust_set_int(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_int(val, kp);
+
+	if (!ret)
+		osd_adjust_update();
+	return ret;
+}
+
+static const struct kernel_param_ops osd_adjust_uint_ops = {
+	.set = osd_adjust_set_uint,
+	.get = param_get_uint,
+};
+
+static const struct kernel_param_ops osd_adjust_int_ops = {
+	.set = osd_adjust_set_int,
+	.get = param_get_int,
+};
+
+module_param_cb(osd_white, &osd_adjust_uint_ops, &osd_white, 0644);
+__MODULE_PARM_TYPE(osd_white, "uint");
+MODULE_PARM_DESC(osd_white, "Graphics plane white level, percent (default 50; 100: as drawn)");
+module_param_cb(osd_saturation, &osd_adjust_uint_ops, &osd_saturation, 0644);
+__MODULE_PARM_TYPE(osd_saturation, "uint");
+MODULE_PARM_DESC(osd_saturation, "Graphics plane saturation, percent, 0-199 (default 90, for sRGB on the wider panel gamut; 100: as drawn)");
+module_param_cb(osd_black, &osd_adjust_int_ops, &osd_black, 0644);
+__MODULE_PARM_TYPE(osd_black, "int");
+MODULE_PARM_DESC(osd_black, "Graphics plane black level offset, -512-511 (default 0: as drawn; shifts all levels)");
+
+/* Let param writes reach @lg's hardware (NULL: no longer), applying them. */
+static void osd_adjust_attach(struct lg1314_drm *lg)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&osd_adjust_lock, flags);
+	osd_adjust_dev = lg;
+	if (lg) {
+		lg->osd_vsp[0] = ~0;	/* unknown: write */
+		osd_adjust_apply(lg);
+	}
+	spin_unlock_irqrestore(&osd_adjust_lock, flags);
+}
+
+void lg1314_osd_detach(struct lg1314_drm *lg)
+{
+	osd_adjust_attach(NULL);
+}
+
+/*
  * Port of FBDEV_M19_CMN_InitHW + SetupSRScaler: program the OSD display
  * geometry (3840x2160 output) and enable the SR 2x scaler (1920 -> 3840).
  */
@@ -77,6 +190,7 @@ void lg1314_osd_init(struct lg1314_drm *lg)
 		OSD_SHP_DETOUR_EN | OSD_SR_CSC_EN, OSD_SR_CSC_EN);
 	lg->osd_sharpen = -1;
 	lg1314_osd_sharpen_update(lg);
+	osd_adjust_attach(lg);
 }
 
 void lg1314_osd_enable(struct lg1314_drm *lg, bool on)

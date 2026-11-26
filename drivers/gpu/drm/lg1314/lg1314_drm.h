@@ -188,6 +188,20 @@ struct lg1314_mmio {
 #define OSD_BITMAP_CTRL0		0x258	/* OSD bank; byte at +0x25b */
 #define OSD_SHP_DETOUR_EN		BIT(28)
 #define OSD_SR_CSC_EN			(BIT(30) | BIT(31))
+/*
+ * Blend-OSD luma/chroma adjust (osd0_vsp_bosd_ctrl_0/1), in the YC section
+ * between the OSD's fixed rgb2yc and yc2rgb CSCs, before the mixer: video is
+ * untouched. Same layout as the video PE's vspyc block (unity: contrast 0x200,
+ * saturation 0x80, offset 0x200; center 0x10, the 16-235 black). Neither GPL
+ * nor stock programs it.
+ */
+#define OSD_VSP_BOSD_CTRL_0		0x260	/* OSD bank */
+#define OSD_VSP_EN			BIT(0)
+#define OSD_VSP_CENTER			GENMASK(15, 8)
+#define OSD_VSP_CONTRAST		GENMASK(25, 16)
+#define OSD_VSP_BOSD_CTRL_1		0x264	/* OSD bank */
+#define OSD_VSP_SATURATION		GENMASK(15, 8)
+#define OSD_VSP_OFFSET			GENMASK(25, 16)
 
 /* OVI bring-up registers (preserved values are read back from lxboot state). */
 #define LG1314_OVI_DPE_PATH_REG		0xc902001c
@@ -312,6 +326,7 @@ struct lg1314_drm {
 	int				irq;
 	unsigned int			vsync_count;
 	int				osd_sharpen;	/* applied: 0, 1; -1 unknown */
+	u32				osd_vsp[2];	/* applied OSD_VSP_BOSD_CTRL_0/1 */
 	bool				video_phase;	/* vblank at video ticks */
 	/* video tick timing, for calibrating the output's rate */
 	unsigned int			tick_n;
@@ -495,6 +510,7 @@ void lg1314_osd_flip(struct lg1314_drm *lg, u32 fb_phys, u32 pitch,
 void lg1314_osd_vsync_irq(struct lg1314_drm *lg, bool on);
 bool lg1314_osd_vsync_ack(struct lg1314_drm *lg);
 void lg1314_osd_sharpen_update(struct lg1314_drm *lg);
+void lg1314_osd_detach(struct lg1314_drm *lg);
 void lg1314_vsync_video_phase(struct lg1314_drm *lg, bool on);
 struct drm_atomic_state;
 int  lg1314_hdr_setup(struct lg1314_drm *lg);
